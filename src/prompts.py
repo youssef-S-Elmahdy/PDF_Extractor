@@ -118,8 +118,24 @@ class PromptTemplates:
         prompt += "DO NOT wrap the JSON in code blocks (no ```json).\n"
         prompt += "Return raw JSON only, starting with { and ending with }.\n\n"
 
-        # TASK DEFINITION
-        prompt += f"TASK: Extract the complete {statement_type} from this financial document.\n\n"
+        # TASK DEFINITION WITH SCOPE
+        prompt += f"TASK: Extract ONLY the {statement_type} from this financial document.\n\n"
+        prompt += "SCOPE AND CONTEXT AWARENESS - CRITICAL:\n"
+        prompt += f"- You are extracting: {statement_type}\n"
+        prompt += f"- This PDF may contain multiple financial statements (income statement, balance sheet, cash flow, notes, etc.)\n"
+        prompt += f"- Your job: Extract ONLY the sections that belong to the {statement_type}\n"
+        prompt += f"- IGNORE all other statements in the PDF - they are not relevant to this extraction task\n"
+        prompt += f"- Use your judgment and vision to identify which sections are part of the {statement_type}\n"
+        prompt += f"- The {statement_type} may span multiple pages - combine all its sections\n"
+        prompt += f"- Do NOT extract sections from other statements just because they exist in the PDF\n\n"
+        prompt += "HOW TO IDENTIFY THE CORRECT STATEMENT:\n"
+        prompt += f"- Look for headings that indicate '{statement_type.upper()}' or similar\n"
+        prompt += f"- Use visual cues (heading style, section breaks) to determine statement boundaries\n"
+        prompt += f"- If uncertain whether a section belongs to {statement_type}, use context clues:\n"
+        prompt += f"  * Does it fit the typical structure of a {statement_type}?\n"
+        prompt += f"  * Is it visually grouped with other {statement_type} sections?\n"
+        prompt += f"  * Does the heading or content clearly indicate it's part of {statement_type}?\n"
+        prompt += f"- When in doubt, default to NOT extracting unless you're confident it belongs to {statement_type}\n\n"
 
         # METADATA EXTRACTION RULES
         prompt += "METADATA EXTRACTION RULES:\n"

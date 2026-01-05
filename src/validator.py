@@ -543,28 +543,38 @@ class ExtractionValidator:
 
 TASK: Verify that sections are correctly identified and structured.
 
+IMPORTANT CONTEXT - SCOPE OF EXTRACTION:
+- The extraction was tasked to extract ONLY: {statement_type}
+- The PDF may contain other financial statements (income statement, balance sheet, cash flow, notes, etc.)
+- You should ONLY validate whether the {statement_type} sections are correct
+- DO NOT flag as errors if other statements in the PDF were not extracted
+- Focus your validation on: "Are the {statement_type} sections extracted correctly?"
+
 EXTRACTED STRUCTURE:
 {section_summary}
 
 VALIDATION CRITERIA (answer YES or NO for each):
 
-1. SECTION COUNT: Is the number of sections ({len(extracted_sections)}) correct?
-   - Look at the PDF and count how many MAJOR sections/tables there are
-   - Only count sections with BOLD HEADINGS or CLEAR VISUAL SEPARATORS
-   - Ignore subsections within tables (they should be nested, not separate)
+1. SECTION COUNT: Is the number of sections ({len(extracted_sections)}) correct FOR THE {statement_type.upper()}?
+   - Look at the PDF and find the {statement_type.upper()} sections
+   - Count how many MAJOR sections/tables belong to the {statement_type}
+   - IGNORE sections from other statements (they should not have been extracted)
+   - Only count sections with BOLD HEADINGS or CLEAR VISUAL SEPARATORS within the {statement_type}
 
-2. SECTION NAMES: Are the section names accurate to what's in the PDF?
-   - Check each section name against the actual headers in the document
+2. SECTION NAMES: Are the section names accurate to the {statement_type} headers in the PDF?
+   - Check each section name against the actual {statement_type} headers
    - Section names should match the semantic meaning of the headers
 
-3. SECTION BOUNDARIES: Are items correctly grouped into sections?
+3. SECTION BOUNDARIES: Are items correctly grouped into sections within the {statement_type}?
    - Check if the first/last items of each section match the actual PDF structure
    - Verify that items haven't been incorrectly split or merged
 
-4. MISSING SECTIONS: Are there any major sections in the PDF that weren't extracted?
-   - Look for any bold section headers that should have been separate sections
+4. MISSING SECTIONS: Are there any {statement_type} sections that weren't extracted?
+   - Look ONLY for {statement_type} sections - ignore other statements
+   - Check if any bold headers within the {statement_type} should have been separate sections
 
-5. EXTRA SECTIONS: Are there any sections in the extraction that shouldn't exist?
+5. EXTRA SECTIONS: Are there any sections that don't belong to the {statement_type}?
+   - Check if sections from OTHER statements were incorrectly included
    - Check if any sections were created from content that should be nested within another section
    - Common error: Creating separate sections for summary/total lines that belong at the end of a table
 
