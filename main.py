@@ -36,10 +36,13 @@ def extract(
     pdf_path: str = typer.Argument(..., help="Path to the PDF file"),
     prompt: Optional[str] = typer.Option(None, "--prompt", "-p", help="Custom extraction prompt"),
     template: Optional[str] = typer.Option(None, "--template", "-t", help="Use a prompt template (table, financial, custom)"),
+    statement_type: str = typer.Option("balance sheet", "--statement-type", "-s", help="Type of financial statement (balance sheet, income statement, cash flow)"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output filename (without extension)"),
     format: List[str] = typer.Option(["json"], "--format", "-f", help="Output format(s): json, txt, csv, md"),
     validate: bool = typer.Option(False, "--validate", "-v", help="Validate extracted data"),
-    model: str = typer.Option("gpt-5.2", "--model", "-m", help="Model to use (gpt-4, gpt-5.2)"),
+    validate_schema: bool = typer.Option(True, "--validate-schema/--no-validate-schema", help="Validate JSON schema compliance"),
+    enforce_json: bool = typer.Option(True, "--enforce-json/--no-enforce-json", help="Enforce strict JSON-only output"),
+    model: str = typer.Option("gpt-5-mini", "--model", "-m", help="Model to use (gpt-4, gpt-5.2)"),
     api_key: Optional[str] = typer.Option(None, "--api-key", help="OpenAI API key (or set OPENAI_API_KEY env var)"),
     preview: bool = typer.Option(True, "--preview/--no-preview", help="Show preview of extracted data")
 ):
@@ -93,8 +96,12 @@ def extract(
             extraction_prompt = prompt_templates.table_extraction_prompt("table")
             console.print(f"[dim]Using table extraction template[/dim]")
         elif template == "financial":
-            extraction_prompt = prompt_templates.financial_statement_prompt()
-            console.print(f"[dim]Using financial statement template[/dim]")
+            extraction_prompt = prompt_templates.financial_statement_prompt(
+                statement_type=statement_type
+            )
+            console.print(f"[dim]Using financial statement template for: {statement_type}[/dim]")
+            if enforce_json:
+                console.print(f"[dim]JSON-only mode enabled[/dim]")
         else:
             # Default prompt
             extraction_prompt = "Extract all relevant information from this PDF in a structured format (JSON preferred)."
@@ -102,7 +109,11 @@ def extract(
 
         # Extract data
         console.print(f"\n[bold]Step 3: Extracting data with {model}[/bold]")
-        result = extractor.multi_page_extract(file_id, extraction_prompt)
+        result = extractor.multi_page_extract(
+            file_id,
+            extraction_prompt,
+            enforce_json=enforce_json
+        )
 
         if not result["success"]:
             console.print(f"[red]Extraction failed: {result['error']}[/red]")
@@ -110,18 +121,74 @@ def extract(
 
         extracted_data = result["output_text"]
 
+        # Show extraction notes if available
+        console.print(f"\n[bold]Step 3b: Extraction Notes (QA Review)[/bold]")
+        try:
+            import json
+            parsed_data = json.loads(extracted_data)
+            if "extraction_notes" in parsed_data and parsed_data["extraction_notes"]:
+                console.print("─" * 80)
+                console.print("[bold cyan]EXTRACTION NOTES:[/bold cyan]")
+                console.print("─" * 80)
+                for note in parsed_data["extraction_notes"]:
+                    console.print(f"  [cyan]•[/cyan] {note}")
+                console.print("─" * 80)
+            else:
+                console.print("[dim]No extraction notes logged by model[/dim]")
+        except json.JSONDecodeError:
+            console.print("[yellow]Cannot parse extraction notes (invalid JSON)[/yellow]")
+        except Exception as e:
+            console.print(f"[dim]Could not display extraction notes: {e}[/dim]")
+
         # Show preview
         if preview:
             formatter.display_preview(extracted_data)
 
         # Validate if requested
         validation_result = None
+        schema_validation_result = None
+
+        # Schema validation (for financial templates)
+        if validate_schema and template == "financial":
+            console.print(f"\n[bold]Step 4a: Validating JSON schema[/bold]")
+            try:
+                import json
+                parsed_data = json.loads(extracted_data)
+                validator = ExtractionValidator(api_key=api_key, model=model)
+                schema_validation_result = validator.validate_financial_json(parsed_data, verbose=True)
+
+                if not schema_validation_result["is_valid"]:
+                    console.print("[yellow]⚠ Schema validation found issues - see details above[/yellow]")
+            except json.JSONDecodeError:
+                console.print("[red]Cannot validate schema - data is not valid JSON[/red]")
+
+        # Content validation - section structure (for financial templates)
+        structure_validation_result = None
+        if validate and template == "financial":
+            console.print(f"\n[bold]Step 4b: Validating section structure against PDF[/bold]")
+            try:
+                import json
+                parsed_data = json.loads(extracted_data)
+                validator = ExtractionValidator(api_key=api_key, model=model)
+                structure_validation_result = validator.validate_section_structure(
+                    file_id=file_id,
+                    data=parsed_data,
+                    statement_type=statement_type,
+                    verbose=True
+                )
+
+                if not structure_validation_result["is_valid"]:
+                    console.print("[red]⚠ Section structure validation found issues - see details above[/red]")
+            except json.JSONDecodeError:
+                console.print("[red]Cannot validate section structure - data is not valid JSON[/red]")
+
+        # Content validation (general re-check against PDF)
         if validate:
-            console.print(f"\n[bold]Step 4: Validating extracted data[/bold]")
+            console.print(f"\n[bold]Step 4c: Validating extracted data against PDF[/bold]")
             validator = ExtractionValidator(api_key=api_key, model=model)
             validation_result = validator.validate(
                 file_id=file_id,
-                data_type="data",
+                data_type=statement_type if template == "financial" else "data",
                 extracted_data=extracted_data
             )
 
@@ -132,7 +199,12 @@ def extract(
                         console.print(f"  [yellow]• {error}[/yellow]")
 
         # Save output
-        step_num = 5 if validate else 4
+        step_num = 5
+        if validate:
+            step_num += 1
+        if validate_schema and template == "financial":
+            step_num += 1
+
         console.print(f"\n[bold]Step {step_num}: Saving output[/bold]")
 
         # Determine output filename
@@ -149,12 +221,18 @@ def extract(
         console.print(f"\n[bold green]✓ Extraction complete![/bold green]")
         console.print(f"\n[bold]Summary:[/bold]")
         console.print(f"  Model: {model}")
+        console.print(f"  Statement type: {statement_type if template == 'financial' else 'N/A'}")
+        console.print(f"  JSON enforcement: {'Enabled' if enforce_json else 'Disabled'}")
         console.print(f"  Input tokens: {result['input_tokens']}")
         console.print(f"  Output tokens: {result['output_tokens']}")
 
+        if schema_validation_result:
+            console.print(f"  Schema validation: {'✓ Passed' if schema_validation_result['is_valid'] else '⚠ Issues found'}")
+            console.print(f"  Schema confidence: {schema_validation_result['confidence']}%")
+
         if validation_result:
-            console.print(f"  Validation: {'✓ Passed' if validation_result['is_valid'] else '⚠ Issues found'}")
-            console.print(f"  Confidence: {validation_result['confidence']}%")
+            console.print(f"  Content validation: {'✓ Passed' if validation_result['is_valid'] else '⚠ Issues found'}")
+            console.print(f"  Content confidence: {validation_result['confidence']}%")
 
         console.print(f"\n[bold]Saved files:[/bold]")
         for fmt, path in saved_files.items():
@@ -174,7 +252,7 @@ def batch(
     prompt: str = typer.Option(..., "--prompt", "-p", help="Extraction prompt for all PDFs"),
     output_dir: str = typer.Option("output", "--output-dir", "-o", help="Output directory"),
     format: str = typer.Option("json", "--format", "-f", help="Output format"),
-    model: str = typer.Option("gpt-5.2", "--model", "-m", help="Model to use"),
+    model: str = typer.Option("gpt-5-mini", "--model", "-m", help="Model to use"),
     api_key: Optional[str] = typer.Option(None, "--api-key", help="OpenAI API key")
 ):
     """

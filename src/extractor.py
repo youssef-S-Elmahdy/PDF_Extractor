@@ -17,7 +17,7 @@ class ExtractionEngine:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-5.2",
+        model: str = "gpt-5-mini",
         max_retries: int = 3,
         retry_delay: int = 2
     ):
@@ -39,7 +39,8 @@ class ExtractionEngine:
         self,
         file_id: str,
         prompt: str,
-        stream: bool = False
+        stream: bool = False,
+        enforce_json: bool = False
     ) -> Dict[str, Any]:
         """
         Extract data from PDF using OpenAI API
@@ -48,6 +49,7 @@ class ExtractionEngine:
             file_id: OpenAI file ID of the uploaded PDF
             prompt: Extraction prompt describing what to extract
             stream: Whether to stream the response (for large outputs)
+            enforce_json: Whether to enforce JSON-only output via response_format parameter
 
         Returns:
             Dictionary containing:
@@ -65,17 +67,35 @@ class ExtractionEngine:
             try:
                 console.print(f"[blue]Running extraction (attempt {attempt + 1}/{self.max_retries})...[/blue]")
 
-                # Create the API request
-                response = self.client.responses.create(
-                    model=self.model,
-                    input=[{
+                # Prepare API request parameters
+                api_params = {
+                    "model": self.model,
+                    "input": [{
                         "role": "user",
                         "content": [
                             {"type": "input_file", "file_id": file_id},
                             {"type": "input_text", "text": prompt}
                         ]
                     }]
-                )
+                }
+
+                # Note: response_format parameter is not supported by responses.create() API
+                # We rely on strict prompt engineering for JSON-only output
+                if enforce_json:
+                    console.print(f"[dim]JSON-only mode: Using strict prompt engineering[/dim]")
+
+                # Create the API request
+                try:
+                    response = self.client.responses.create(**api_params)
+                except TypeError as e:
+                    # response_format not supported by this API endpoint
+                    # This is expected - remove it and retry
+                    if "response_format" in str(e):
+                        console.print(f"[dim]Note: response_format not supported by API, using prompt-only approach[/dim]")
+                        api_params.pop("response_format", None)
+                        response = self.client.responses.create(**api_params)
+                    else:
+                        raise
 
                 # Extract response data
                 output_text = response.output_text if hasattr(response, 'output_text') else str(response)
@@ -166,7 +186,8 @@ class ExtractionEngine:
         self,
         file_id: str,
         prompt: str,
-        handle_continuation: bool = True
+        handle_continuation: bool = True,
+        enforce_json: bool = False
     ) -> Dict[str, Any]:
         """
         Handle extraction that may span multiple responses
@@ -175,6 +196,7 @@ class ExtractionEngine:
             file_id: OpenAI file ID of the uploaded PDF
             prompt: Extraction prompt
             handle_continuation: Whether to handle CONTINUE signals
+            enforce_json: Whether to enforce JSON-only output
 
         Returns:
             Complete extraction result
@@ -182,11 +204,19 @@ class ExtractionEngine:
         Note:
             If output is too large, model may indicate continuation needed.
             This method handles combining multi-part responses.
+            With enforce_json=True, continuation handling is disabled since
+            JSON mode may not support [CONTINUE] markers.
         """
-        # Add instruction to handle large outputs
+        # If JSON enforcement is enabled, skip continuation handling
+        # The model should return complete JSON in one response
+        if enforce_json:
+            console.print(f"[dim]JSON mode: expecting complete response in single call[/dim]")
+            return self.extract(file_id, prompt, enforce_json=True)
+
+        # Add instruction to handle large outputs (for non-JSON mode)
         enhanced_prompt = f"{prompt}\n\nIf the output is too large to fit in one response, indicate '[CONTINUE]' and I will prompt you to continue."
 
-        result = self.extract(file_id, enhanced_prompt)
+        result = self.extract(file_id, enhanced_prompt, enforce_json=False)
 
         if handle_continuation and result["success"]:
             output = result["output_text"]
@@ -200,7 +230,7 @@ class ExtractionEngine:
 
                 # Request continuation
                 continue_prompt = "Continue from where you left off."
-                continue_result = self.extract(file_id, continue_prompt)
+                continue_result = self.extract(file_id, continue_prompt, enforce_json=False)
 
                 if continue_result["success"]:
                     # Remove the [CONTINUE] marker and append new content

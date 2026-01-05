@@ -4,6 +4,7 @@ Output formatting module for extracted data
 
 import json
 import csv
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import pandas as pd
@@ -32,7 +33,7 @@ class OutputFormatter:
         pretty: bool = True
     ) -> str:
         """
-        Format data as JSON
+        Format data as JSON with strict validation
 
         Args:
             data: Raw extracted data (should be JSON string)
@@ -40,6 +41,10 @@ class OutputFormatter:
 
         Returns:
             Formatted JSON string
+
+        Note:
+            This method now fails loudly if JSON is invalid, providing detailed
+            error messages to help debug prompt issues.
         """
         try:
             # Try to parse as JSON
@@ -47,10 +52,64 @@ class OutputFormatter:
             if pretty:
                 return json.dumps(parsed, indent=2, ensure_ascii=False)
             return json.dumps(parsed, ensure_ascii=False)
-        except json.JSONDecodeError:
-            # If not valid JSON, wrap it
-            console.print("[yellow]Data is not valid JSON, wrapping in object[/yellow]")
-            result = {"extracted_data": data}
+
+        except json.JSONDecodeError as e:
+            # Fail loudly with detailed error information
+            console.print("[red]═══════════════════════════════════════════════════════════[/red]")
+            console.print("[red]ERROR: Model returned invalid JSON![/red]")
+            console.print("[red]═══════════════════════════════════════════════════════════[/red]")
+            console.print(f"[red]JSON Parse Error: {str(e)}[/red]")
+            console.print(f"[red]Error at position: {e.pos}[/red]")
+
+            # Show preview of raw output
+            console.print(f"\n[yellow]Raw output (first 500 characters):[/yellow]")
+            console.print(f"[dim]{data[:500]}...[/dim]")
+
+            # Try to extract JSON from markdown code blocks
+            console.print(f"\n[yellow]Attempting to extract JSON from markdown blocks...[/yellow]")
+            json_match = re.search(r'```(?:json)?\s*(\{.*\})\s*```', data, re.DOTALL)
+
+            if json_match:
+                console.print("[yellow]Found JSON in markdown block, extracting...[/yellow]")
+                try:
+                    extracted_json = json_match.group(1)
+                    parsed = json.loads(extracted_json)
+                    console.print("[green]✓ Successfully extracted JSON from markdown[/green]")
+                    if pretty:
+                        return json.dumps(parsed, indent=2, ensure_ascii=False)
+                    return json.dumps(parsed, ensure_ascii=False)
+                except json.JSONDecodeError as e2:
+                    console.print(f"[red]Markdown extraction failed: {str(e2)}[/red]")
+
+            # Try to find JSON object boundaries
+            console.print(f"\n[yellow]Attempting to extract JSON by finding braces...[/yellow]")
+            brace_match = re.search(r'(\{.*\})', data, re.DOTALL)
+
+            if brace_match:
+                console.print("[yellow]Found potential JSON object, attempting parse...[/yellow]")
+                try:
+                    extracted_json = brace_match.group(1)
+                    parsed = json.loads(extracted_json)
+                    console.print("[green]✓ Successfully extracted JSON by finding braces[/green]")
+                    if pretty:
+                        return json.dumps(parsed, indent=2, ensure_ascii=False)
+                    return json.dumps(parsed, ensure_ascii=False)
+                except json.JSONDecodeError as e3:
+                    console.print(f"[red]Brace extraction failed: {str(e3)}[/red]")
+
+            # Last resort: wrap in error object with warning
+            console.print(f"\n[red]⚠ All JSON extraction attempts failed![/red]")
+            console.print("[yellow]Wrapping in error object as last resort[/yellow]")
+            console.print("[yellow]This indicates the prompt is not working correctly.[/yellow]")
+            console.print("[yellow]Action required: Review prompt engineering or model response.[/yellow]")
+
+            result = {
+                "error": "Model returned invalid JSON",
+                "parse_error": str(e),
+                "raw_output": data,
+                "output_preview": data[:1000]
+            }
+
             if pretty:
                 return json.dumps(result, indent=2, ensure_ascii=False)
             return json.dumps(result, ensure_ascii=False)

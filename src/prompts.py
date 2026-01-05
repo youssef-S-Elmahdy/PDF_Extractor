@@ -103,39 +103,437 @@ class PromptTemplates:
         statement_type: str = "balance sheet"
     ) -> str:
         """
-        Specialized prompt for financial statement extraction
+        Production-grade financial statement extraction prompt.
+        Engineered for 100% JSON compliance with zero narrative text.
 
         Args:
-            statement_type: Type of financial statement (balance sheet, income statement, etc.)
+            statement_type: Type of financial statement (balance sheet, income statement, cash flow)
 
         Returns:
-            Formatted financial statement extraction prompt
+            Formatted financial statement extraction prompt with strict JSON enforcement
         """
-        prompt = f"Extract the complete {statement_type} from this PDF.\n\n"
-        prompt += "Financial Statement Requirements:\n"
-        prompt += "- Include all line items with exact labels\n"
-        prompt += "- Capture all time periods/columns (years, quarters, etc.)\n"
-        prompt += "- Include all subtotals and category totals\n"
-        prompt += "- Preserve the account hierarchy (assets > current assets > cash, etc.)\n"
-        prompt += "- Include all numeric values with correct signs (positive/negative)\n"
-        prompt += "- Note the currency and units (thousands, millions, etc.)\n"
-        prompt += "- Include any footnote references or annotations\n"
-        prompt += "- If multi-page, combine all sections into one complete statement\n\n"
-        prompt += "Format as JSON with this structure:\n"
+        # CRITICAL: Start with absolute prohibition on narrative
+        prompt = "You are a financial data extraction API. You MUST return ONLY valid JSON.\n"
+        prompt += "DO NOT include any explanatory text, commentary, notes, or markdown formatting.\n"
+        prompt += "DO NOT wrap the JSON in code blocks (no ```json).\n"
+        prompt += "Return raw JSON only, starting with { and ending with }.\n\n"
+
+        # TASK DEFINITION
+        prompt += f"TASK: Extract the complete {statement_type} from this financial document.\n\n"
+
+        # METADATA EXTRACTION RULES
+        prompt += "METADATA EXTRACTION RULES:\n"
+        prompt += "1. AUTO-DETECT company name from document header/title/footer\n"
+        prompt += "2. AUTO-DETECT reporting date/period (e.g., 'December 31, 2024' or 'Q4 2024')\n"
+        prompt += "3. AUTO-DETECT currency (EUR, USD, GBP, etc.) from document symbols/text\n"
+        prompt += "4. AUTO-DETECT units from table headers (thousands, millions, billions, etc.)\n\n"
+
+        # UNIT CONVERSION RULES (CRITICAL)
+        prompt += "UNIT CONVERSION RULES - EXTREMELY IMPORTANT:\n"
+        prompt += "If the document states 'in thousands', 'in millions', or 'in billions':\n"
+        prompt += "- You MUST MULTIPLY all numeric values to convert them to base units (actual full numbers)\n"
+        prompt += "- Examples of correct conversion:\n"
+        prompt += "  * Document shows '201,680' with header 'in EUR millions' → store as 201680000000\n"
+        prompt += "  * Document shows '1,234' with '(in thousands)' → store as 1234000\n"
+        prompt += "  * Document shows '456' with '(in millions)' → store as 456000000\n"
+        prompt += "  * Document shows '789' with '(in billions)' → store as 789000000000\n"
+        prompt += "- Set 'units_multiplier' field to show what you multiplied by:\n"
+        prompt += "  * 1000 for thousands\n"
+        prompt += "  * 1000000 for millions\n"
+        prompt += "  * 1000000000 for billions\n"
+        prompt += "  * 1 if values are already in base units\n"
+        prompt += "- Set 'original_units' field to the exact unit text from the document\n\n"
+
+        # VALUE CLEANING RULES (CRITICAL)
+        prompt += "VALUE CLEANING RULES - FOLLOW EXACTLY:\n"
+        prompt += "1. REMOVE all currency symbols (€, $, £, USD, EUR, etc.) from values\n"
+        prompt += "   - Store currency in metadata only, NOT in numeric values\n"
+        prompt += "2. REMOVE all thousand separators (commas, dots, spaces, apostrophes)\n"
+        prompt += "   - '1,234,567' becomes 1234567\n"
+        prompt += "   - '1.234.567' becomes 1234567\n"
+        prompt += "3. CONVERT parentheses to negative numbers:\n"
+        prompt += "   - '(1,234)' becomes -1234\n"
+        prompt += "   - '(500.50)' becomes -500.50\n"
+        prompt += "   - '(1,234,567)' becomes -1234567\n"
+        prompt += "4. REMOVE decorative dots, dashes, or underscores before values:\n"
+        prompt += "   - 'Cash and equivalents........500' → extract value as 500\n"
+        prompt += "   - 'Total assets------------1234' → extract value as 1234\n"
+        prompt += "5. Store ALL values as numbers (integer or float), NEVER as strings\n"
+        prompt += "6. If a cell is empty or shows '-' or 'n/a', use null (not 0, not string)\n\n"
+
+        # LABEL PRESERVATION RULES
+        prompt += "LABEL PRESERVATION RULES - CRITICAL:\n"
+        prompt += "- Extract labels EXACTLY as written in the document\n"
+        prompt += "- DO NOT add context or interpretation (e.g., 'Total' should stay 'Total', not 'Total Assets')\n"
+        prompt += "- DO NOT expand abbreviations unless explicitly shown in the document\n"
+        prompt += "- Preserve capitalization, punctuation, and formatting exactly\n\n"
+
+        # NOTE REFERENCE SEPARATION RULES
+        prompt += "NOTE REFERENCE SEPARATION RULES - CRITICAL:\n"
+        prompt += "When a line item has both a label and note references:\n"
+        prompt += "1. DETECT note references by pattern matching:\n"
+        prompt += "   - Single: 'Note X.X', 'Note X', 'Note X.X.X'\n"
+        prompt += "   - Multiple: 'Notes X.X, X.X and X.X', 'Notes X.X and X.X', 'Notes X, X and X'\n"
+        prompt += "2. SEPARATE the note reference from the label:\n"
+        prompt += "   - Label goes in 'label' field (without notes)\n"
+        prompt += "   - Notes go in 'notes_reference' field (exact text)\n"
+        prompt += "3. EXAMPLES:\n"
+        prompt += "   - Source: 'Financial assets at fair value through profit or loss Notes 3.1, 3.2 and 3.4'\n"
+        prompt += "     → label: 'Financial assets at fair value through profit or loss'\n"
+        prompt += "     → notes_reference: 'Notes 3.1, 3.2 and 3.4'\n"
+        prompt += "   - Source: 'Customer loans at amortised cost Note 3.5'\n"
+        prompt += "     → label: 'Customer loans at amortised cost'\n"
+        prompt += "     → notes_reference: 'Note 3.5'\n"
+        prompt += "   - Source: 'Cash, due from central banks' (no notes)\n"
+        prompt += "     → label: 'Cash, due from central banks'\n"
+        prompt += "     → notes_reference: null\n"
+        prompt += "4. DO NOT include note references in labels - they belong only in notes_reference field\n\n"
+
+        # SECTION STRUCTURE DETECTION
+        prompt += "SECTION STRUCTURE DETECTION - CRITICAL:\n\n"
+        prompt += "1. IDENTIFY how many distinct tables/sections are in the document:\n"
+        prompt += "   - Look for major headings, table titles, section breaks\n"
+        prompt += "   - Each major section typically becomes a separate JSON array\n\n"
+        prompt += "2. PRESERVE the document's structure:\n"
+        prompt += "   - If sections are separate tables → create separate arrays\n"
+        prompt += "   - If subsections are nested within a table → keep them nested using 'level' field\n\n"
+        prompt += "3. MAINTAIN hierarchy with 'level' field:\n"
+        prompt += "   - Level 1: Main sections/categories\n"
+        prompt += "   - Level 2: Subsections\n"
+        prompt += "   - Level 3: Line items\n"
+        prompt += "   - Level 4+: Sub-items (if needed)\n\n"
+        prompt += "4. CAPTURE ALL content:\n"
+        prompt += "   - Section headers (even if no numeric values)\n"
+        prompt += "   - All line items\n"
+        prompt += "   - All subtotals\n"
+        prompt += "   - Final totals\n\n"
+
+        # HIERARCHICAL STRUCTURE
+        prompt += "HIERARCHICAL STRUCTURE RULES:\n"
+        prompt += "- Assign 'level' to each line item to show hierarchy:\n"
+        prompt += "  * level 1: Main category headers (e.g., 'Current Assets', 'Total Assets')\n"
+        prompt += "  * level 2: Sub-categories (e.g., 'Cash and Cash Equivalents')\n"
+        prompt += "  * level 3: Detail items (e.g., 'Cash in Bank Accounts')\n"
+        prompt += "- Mark totals and subtotals with 'is_total': true\n"
+        prompt += "  * Examples: 'Total Current Assets', 'Total Assets', 'Total Liabilities and Equity'\n"
+        prompt += "- Preserve notes references if present (e.g., 'Notes 3.1, 3.2')\n"
+        prompt += "- Maintain line_number sequence for all items\n\n"
+
+        # PDF-SPECIFIC PATTERN ANALYSIS - CRITICAL
+        prompt += "PDF-SPECIFIC PATTERN ANALYSIS - PERFORM THIS FIRST:\n\n"
+        prompt += "STEP 1: ANALYZE THIS DOCUMENT'S UNIQUE FORMATTING PATTERNS\n"
+        prompt += "Before extracting, scan the ENTIRE document to identify ITS specific formatting patterns:\n\n"
+        prompt += "1. HEADING PATTERNS in this PDF:\n"
+        prompt += "   - What makes a heading in THIS document? (all-caps, bold, font size, underline, specific indentation?)\n"
+        prompt += "   - Are headings consistently formatted the same way throughout?\n"
+        prompt += "   - Document your findings: 'In this PDF, major section headings are: [describe pattern]'\n\n"
+        prompt += "2. TABLE STRUCTURE PATTERNS in this PDF:\n"
+        prompt += "   - How does this document indicate table boundaries? (lines, spacing, column structure changes?)\n"
+        prompt += "   - Does this PDF use visible borders/lines for tables or borderless tables?\n"
+        prompt += "   - How are column headers formatted vs data rows?\n"
+        prompt += "   - Document: 'In this PDF, tables are structured as: [describe]'\n\n"
+        prompt += "3. SPACING PATTERNS in this PDF:\n"
+        prompt += "   - What vertical spacing is used between sections vs within sections?\n"
+        prompt += "   - Is spacing consistent throughout the document?\n"
+        prompt += "   - Document: 'Section breaks in this PDF use: [describe spacing pattern]'\n\n"
+        prompt += "4. TYPOGRAPHY PATTERNS in this PDF:\n"
+        prompt += "   - What font sizes are used for different hierarchy levels?\n"
+        prompt += "   - When is bold used vs regular weight?\n"
+        prompt += "   - Are there consistent capitalization patterns (ALL CAPS for certain levels)?\n"
+        prompt += "   - Document: 'Typography hierarchy in this PDF: [describe]'\n\n"
+        prompt += "5. MULTI-PAGE TABLE CONTINUATION PATTERNS:\n"
+        prompt += "   - When a table continues to next page: are column headers repeated?\n"
+        prompt += "   - Are there 'continued' labels or indicators?\n"
+        prompt += "   - Does the table maintain same column structure across pages?\n"
+        prompt += "   - When a NEW table starts: what visual breaks are present?\n"
+        prompt += "   - Document: 'Multi-page table patterns: [describe how to distinguish continuation vs new table]'\n\n"
+        prompt += "6. INDENTATION PATTERNS in this PDF:\n"
+        prompt += "   - Measure indentation levels used for hierarchy (0px, 10px, 20px, etc.)\n"
+        prompt += "   - Are tabs or spaces used for indentation?\n"
+        prompt += "   - How many indentation levels are present?\n"
+        prompt += "   - What does each indentation level represent? (e.g., level 1 = main section, level 2 = subsection)\n"
+        prompt += "   - Is indentation consistent throughout or does it vary?\n"
+        prompt += "   - Document: 'Indentation hierarchy in this PDF: [describe levels and their pixel/character measurements]'\n\n"
+        prompt += "7. LINE AND BORDER PATTERNS in this PDF:\n"
+        prompt += "   - Does this PDF use horizontal lines to separate sections or rows?\n"
+        prompt += "   - Are there vertical lines creating column boundaries?\n"
+        prompt += "   - Line thickness/style differences (thin vs thick, solid vs dashed)?\n"
+        prompt += "   - Where are lines used vs omitted (e.g., lines under headers but not data rows)?\n"
+        prompt += "   - Do line patterns indicate hierarchy or section boundaries?\n"
+        prompt += "   - Document: 'Line/border patterns: [describe where, how, and why lines are used]'\n\n"
+        prompt += "8. PRECISE SPACING ANALYSIS in this PDF:\n"
+        prompt += "   - Measure vertical spacing: how many pixels/lines between different elements?\n"
+        prompt += "   - Within-section spacing vs between-section spacing (provide specific measurements)\n"
+        prompt += "   - Horizontal spacing: distance between columns, left/right margins, padding\n"
+        prompt += "   - Are spacing patterns consistent or do they vary by section type?\n"
+        prompt += "   - Does spacing correlate with hierarchy or importance?\n"
+        prompt += "   - Document: 'Spacing measurements: [e.g., 5px within sections, 20px between sections, 2px between rows]'\n\n"
+        prompt += "9. ADVANCED VISUAL CUES in this PDF:\n"
+        prompt += "   - Background colors or shading for headers vs data rows?\n"
+        prompt += "   - Cell borders (full borders, partial borders, no borders, border positioning)?\n"
+        prompt += "   - Alignment patterns (left-aligned text vs right-aligned numbers vs centered headers)?\n"
+        prompt += "   - Visual grouping techniques (boxing, shading, whitespace, clustering)?\n"
+        prompt += "   - Font weight variations beyond bold (semibold, light, regular)?\n"
+        prompt += "   - Any other visual patterns unique to this document?\n"
+        prompt += "   - Document: 'Advanced visual patterns: [describe any other PDF-specific visual cues]'\n\n"
+        prompt += "STEP 2: APPLY THIS PDF'S PATTERNS TO DETECT STRUCTURE\n\n"
+        prompt += "Once you've identified ALL patterns above (including indentation, lines, spacing), use them TOGETHER:\n\n"
+        prompt += "- Identify section boundaries using: heading pattern + spacing pattern + line separators + indentation changes\n"
+        prompt += "- Detect hierarchy levels using: indentation levels + typography + spacing + alignment\n"
+        prompt += "- Recognize table boundaries using: lines/borders + spacing + column structure + visual grouping\n"
+        prompt += "- Detect table continuations using: indentation consistency + column alignment + spacing patterns + header repetition\n"
+        prompt += "- Group related items using: indentation + spacing + visual separators + alignment patterns\n\n"
+        prompt += "LEVERAGE ADVANCED VISION CAPABILITIES:\n\n"
+        prompt += "- MEASURE spacing precisely using your vision (count pixels, lines, characters)\n"
+        prompt += "- DETECT subtle visual cues that distinguish hierarchy levels\n"
+        prompt += "- OBSERVE indentation patterns that might not be obvious from text parsing alone\n"
+        prompt += "- COUNT indentation pixels/characters to determine exact nesting levels\n"
+        prompt += "- RECOGNIZE line patterns (thickness, style, position) to identify boundaries\n"
+        prompt += "- ANALYZE whitespace distribution to detect visual groupings\n"
+        prompt += "- COMBINE multiple visual signals for confident structure detection\n\n"
+        prompt += "CRITICAL: Use vision to see the PDF as a human would - notice spacing, alignment, lines, and indentation\n"
+        prompt += "that create visual hierarchy and structure. Don't rely solely on text content.\n\n"
+        prompt += "STEP 3: LOG YOUR PATTERN ANALYSIS\n\n"
+        prompt += "In extraction_notes, you MUST include comprehensive pattern analysis:\n\n"
+        prompt += '- "Document formatting analysis: [heading, table, spacing, typography, indentation, lines, advanced visual]"\n'
+        prompt += '- "Indentation hierarchy: [levels found with measurements, e.g., 0px/15px/30px for levels 1/2/3]"\n'
+        prompt += '- "Line/border usage: [where and how lines separate elements, thickness/style patterns]"\n'
+        prompt += '- "Spacing measurements: [specific pixel/line values, e.g., 3px row spacing, 15px section spacing]"\n'
+        prompt += '- "Visual grouping cues: [how alignment, shading, borders create visual groups]"\n'
+        prompt += '- "Section detection strategy: [how you combined ALL visual patterns to identify sections]"\n'
+        prompt += '- "Table continuation detection: [how spacing + indentation + lines helped distinguish continued vs new]"\n'
+        prompt += '- "Hierarchy detection: [how indentation + typography + spacing determined nesting levels]"\n\n'
+        prompt += "CRITICAL: Each PDF is different. Do NOT apply memorized patterns from other documents.\n"
+        prompt += "Analyze THIS document first, then extract based on what YOU observe in THIS specific PDF.\n\n"
+
+        # MULTI-PAGE HANDLING
+        prompt += "MULTI-PAGE TABLE CONTINUATION - CRITICAL:\n\n"
+        prompt += "Tables often span multiple pages with headers/footers/logos in between. You MUST distinguish:\n\n"
+        prompt += "TABLE CONTINUES TO NEXT PAGE (keep in same section) when:\n"
+        prompt += "- Column headers are repeated at top of next page\n"
+        prompt += "- Same column structure (same number and types of columns)\n"
+        prompt += "- No new bold section heading between pages\n"
+        prompt += "- Visual continuation indicators (e.g., 'continued', same table style)\n"
+        prompt += "- Line items continue the same list/sequence\n"
+        prompt += "- Consistent indentation and formatting\n\n"
+        prompt += "NEW TABLE STARTS (create new section) when:\n"
+        prompt += "- New bold heading or section title appears\n"
+        prompt += "- Different column structure (different columns than previous table)\n"
+        prompt += "- Clear visual break (extra spacing, horizontal line, new formatting)\n"
+        prompt += "- Different semantic purpose (e.g., switching from Assets to Liabilities)\n\n"
+        prompt += "HANDLING HEADERS/FOOTERS/LOGOS:\n"
+        prompt += "- Ignore page numbers, headers, footers, and logos when detecting continuity\n"
+        prompt += "- Focus on the table content itself\n"
+        prompt += "- If table structure matches before/after page break → same table continues\n\n"
+        prompt += "EXTRACT ALL PAGES:\n"
+        prompt += "- Combine continued tables into single arrays\n"
+        prompt += "- Maintain continuous line numbering across pages\n"
+        prompt += "- DO NOT create separate sections for each page\n\n"
+        prompt += "LOG MULTI-PAGE DECISIONS:\n"
+        prompt += '- "Page X to Y: Table continues (same columns, no new heading)"\n'
+        prompt += '- "Page Y: New section starts (bold heading \'...\' detected)"\n\n'
+
+        # PERIOD EXTRACTION RULES
+        prompt += "PERIOD EXTRACTION RULES - CRITICAL:\n"
+        prompt += "1. Extract column header dates/periods EXACTLY as they appear in the document\n"
+        prompt += "2. Store THREE formats in metadata.periods array:\n"
+        prompt += '   - "label": The exact text from the column header\n'
+        prompt += '   - "iso_date": ISO 8601 format (YYYY-MM-DD) - you MUST convert to ISO using your best judgment\n'
+        prompt += '   - "context": Brief explanation of how you interpreted ambiguous dates (optional)\n'
+        prompt += "3. Use the ISO DATE (iso_date field) as keys in all 'values' objects\n"
+        prompt += "4. For interpreting partial/ambiguous dates, use your best judgment based on document context:\n"
+        prompt += "   - '2024' alone → Infer fiscal year-end from document (e.g., '2024-06-30' if June FY, '2024-12-31' if calendar year)\n"
+        prompt += "   - 'Q1 2024' → Quarter end date '2024-03-31'\n"
+        prompt += "   - 'Q2 2024' → Quarter end date '2024-06-30'\n"
+        prompt += "   - 'Q3 2024' → Quarter end date '2024-09-30'\n"
+        prompt += "   - 'Q4 2024' → Quarter end date '2024-12-31'\n"
+        prompt += "   - 'FY 2024' → Detect fiscal year-end from document context and headers\n"
+        prompt += "5. Add 'context' field explaining your date interpretation when the date was ambiguous or required inference\n"
+        prompt += "6. Examples:\n"
+        prompt += '   - Document shows "As of June 30, 2024" → {"label": "As of June 30, 2024", "iso_date": "2024-06-30", "context": "Exact date provided"}\n'
+        prompt += '   - Document shows "31.12.2024" → {"label": "31.12.2024", "iso_date": "2024-12-31", "context": "Exact date provided"}\n'
+        prompt += '   - Document shows "Q4 2024" → {"label": "Q4 2024", "iso_date": "2024-12-31", "context": "Q4 end date"}\n'
+        prompt += '   - Document shows "2024" with June fiscal year → {"label": "2024", "iso_date": "2024-06-30", "context": "Fiscal year ending June 30 (inferred from document header)"}\n\n'
+
+        # SECTION DETECTION AND ARRAY NAMING
+        prompt += "SECTION DETECTION AND ARRAY CREATION - CRITICAL:\n\n"
+        prompt += "You MUST analyze the document and create JSON arrays dynamically:\n\n"
+        prompt += "1. IDENTIFY all major sections/tables in the document:\n"
+        prompt += "   - Look for table headers, section titles, bold headings\n"
+        prompt += "   - Each major section becomes a separate JSON array\n\n"
+        prompt += "2. NAME each array based on the section header:\n"
+        prompt += "   - Convert to snake_case (lowercase with underscores)\n"
+        prompt += "   - Remove special characters\n"
+        prompt += "   - Keep names concise but descriptive\n"
+        prompt += "   - Examples:\n"
+        prompt += "     • 'CONSOLIDATED BALANCE SHEET - ASSETS' → 'assets'\n"
+        prompt += "     • 'LIABILITIES AND EQUITY' → 'liabilities_and_equity'\n"
+        prompt += "     • 'Operating Activities' → 'operating_activities'\n"
+        prompt += "     • 'Revenue from Operations' → 'revenue_from_operations'\n\n"
+        prompt += "3. NESTED sections:\n"
+        prompt += "   - Keep nested items WITHIN parent array using 'level' field\n"
+        prompt += "   - Example: If 'Equity' is a subsection under 'Liabilities', keep it in the 'liabilities' array\n\n"
+        prompt += "4. DOCUMENT decisions in extraction_notes:\n"
+        prompt += "   - Log which sections detected\n"
+        prompt += "   - Log what you named each array and why\n\n"
+        prompt += "5. VISUAL SECTION BOUNDARIES USING PDF-SPECIFIC PATTERNS:\n\n"
+        prompt += "   Apply ALL patterns YOU identified in STEP 1 - combine multiple visual cues for accuracy.\n\n"
+        prompt += "   CREATE a new section/array when you observe THIS PDF's COMBINED pattern signals:\n"
+        prompt += "   - Heading pattern (e.g., ALL CAPS BOLD) + increased spacing before + horizontal line separator\n"
+        prompt += "   - Indentation reset to level 0 + spacing change + different visual grouping\n"
+        prompt += "   - Table structure change (different columns) + vertical line separator + new alignment pattern\n"
+        prompt += "   - Look for CLUSTERS of visual cues, not just single indicators\n"
+        prompt += "   - When 3+ visual signals align → high confidence section boundary\n\n"
+        prompt += "   USE INDENTATION to determine hierarchy and grouping:\n"
+        prompt += "   - Items at SAME indentation level → same hierarchy level (nest together)\n"
+        prompt += "   - Increased indentation → nested/child item (increase level number)\n"
+        prompt += "   - Decreased indentation → back to parent level (decrease level number)\n"
+        prompt += "   - Consistent indentation across pages → table continues (same section)\n"
+        prompt += "   - Indentation reset + other signals → new section starts\n\n"
+        prompt += "   USE LINES/BORDERS to determine boundaries:\n"
+        prompt += "   - Horizontal line across FULL WIDTH → likely section boundary\n"
+        prompt += "   - Horizontal line WITHIN table columns → row separator (NOT section boundary)\n"
+        prompt += "   - Vertical lines → column boundaries (table structure, not section breaks)\n"
+        prompt += "   - Thick line vs thin line → may indicate major vs minor boundaries\n"
+        prompt += "   - Line style change (solid → dashed) → may indicate hierarchy change\n\n"
+        prompt += "   USE SPACING to determine grouping:\n"
+        prompt += "   - Large vertical spacing (e.g., 20px+) → likely section boundary\n"
+        prompt += "   - Small vertical spacing (e.g., 3-5px) → items within same section\n"
+        prompt += "   - Spacing BEFORE element > spacing AFTER → likely new section starting\n"
+        prompt += "   - Consistent small spacing across pages → table continues\n"
+        prompt += "   - Sudden spacing increase → potential section break\n\n"
+        prompt += "   USE ALIGNMENT and VISUAL GROUPING:\n"
+        prompt += "   - Items with same left alignment → likely same hierarchy level\n"
+        prompt += "   - Shading/background color change → may indicate new section\n"
+        prompt += "   - Border boxing around items → visual group (keep together)\n"
+        prompt += "   - Right-aligned numbers in consistent columns → table continues\n\n"
+        prompt += "   DO NOT create new sections based on:\n"
+        prompt += "   - Content interpretation alone (e.g., recognizing 'this looks like a summary')\n"
+        prompt += "   - Memorized patterns from OTHER documents\n"
+        prompt += "   - Semantic meaning without visual cues (e.g., 'cash reconciliation' needs visual break to be separate)\n"
+        prompt += "   - Line item labels alone without THIS PDF's visual break pattern\n\n"
+        prompt += "   DEFAULT BEHAVIOR when uncertain:\n"
+        prompt += "   - If you're NOT 100% confident there's a visual break → KEEP items in the same section\n"
+        prompt += "   - Lines that visually continue within the same table MUST stay together\n"
+        prompt += "   - Subtotals followed by more rows WITHOUT a bold heading → stay in same section\n"
+        prompt += "   - Summary lines at table end WITHOUT a bold heading → stay in same section\n\n"
+        prompt += "   CONFIDENCE LOGGING - REQUIRED:\n"
+        prompt += "   - Log in extraction_notes whenever section boundaries are uncertain\n"
+        prompt += "   - Explain what visual cues you used (or didn't find) for each section boundary decision\n"
+        prompt += "   - If confidence is LOW on a boundary → explicitly state you kept items together by default\n\n"
+        prompt += "   Example logging:\n"
+        prompt += '   - "Section boundary after line 15: Clear bold heading \'CASH FLOWS FROM OPERATING ACTIVITIES\' - high confidence"\n'
+        prompt += '   - "Lines 45-50: No bold heading detected, items continue same table structure, kept in previous section - medium confidence"\n'
+        prompt += '   - "Line 60: Uncertain if \'Net change in cash\' starts new section (no visual break observed), defaulted to keeping in last section"\n\n'
+        prompt += "6. RE-EXAMINATION FOR LOW CONFIDENCE DECISIONS:\n\n"
+        prompt += "   If you encounter ANY uncertainty about section boundaries:\n"
+        prompt += "   - Revisit that specific area of the document\n"
+        prompt += "   - Focus ONLY on visual formatting: bold text, font size, spacing, lines, indentation\n"
+        prompt += "   - Ignore the semantic meaning of text\n"
+        prompt += "   - Log your focused re-examination findings in extraction_notes\n\n"
+
+        # EXTRACTION NOTES - REQUIRED
+        prompt += "EXTRACTION NOTES - REQUIRED FOR QUALITY ASSURANCE:\n\n"
+        prompt += "You MUST populate the extraction_notes array with detailed logging:\n\n"
+        prompt += "0. PDF-SPECIFIC PATTERN ANALYSIS (REQUIRED FIRST):\n"
+        prompt += '   - Document formatting analysis: [heading, table, spacing, typography, indentation, lines, advanced visual]\n'
+        prompt += '   - Indentation hierarchy: [levels with measurements, e.g., "0px/15px/30px for levels 1/2/3"]\n'
+        prompt += '   - Line/border usage: [where lines separate elements, thickness/style patterns]\n'
+        prompt += '   - Spacing measurements: [specific values, e.g., "3px rows, 15px sections, 25px page breaks"]\n'
+        prompt += '   - Visual grouping cues: [alignment, shading, borders, whitespace]\n'
+        prompt += '   - Section detection strategy: [how you combined ALL visual patterns to identify sections]\n'
+        prompt += '   - Hierarchy detection: [how indentation + typography + spacing determined nesting]\n'
+        prompt += '   - Multi-page table continuation: [how spacing + indentation + lines helped distinguish]\n'
+        prompt += '   - Pattern consistency: [formatting inconsistencies observed and how you handled them]\n\n'
+        prompt += "1. STRUCTURAL DECISIONS:\n"
+        prompt += '   - How many tables/sections detected and their names\n'
+        prompt += '   - How sections are organized (e.g., "Equity nested in Liabilities")\n'
+        prompt += '   - Array naming decisions (what you named each array and why)\n'
+        prompt += '   - Multi-page decisions: [which tables spanned multiple pages and how you detected continuity]\n\n'
+        prompt += "2. AMBIGUITIES ENCOUNTERED:\n"
+        prompt += '   - Unclear cell values or labels\n'
+        prompt += '   - How you interpreted them\n'
+        prompt += '   - Confidence level in interpretation\n\n'
+        prompt += "3. DATA HANDLING DECISIONS:\n"
+        prompt += '   - How special formatting was handled (parentheses, dashes, n/a)\n'
+        prompt += '   - Currency symbol removal\n'
+        prompt += '   - Unit conversions applied\n'
+        prompt += '   - Empty cells interpretation\n'
+        prompt += '   - Note references separated from labels\n\n'
+        prompt += "4. EDGE CASES:\n"
+        prompt += '   - Merged cells across rows\n'
+        prompt += '   - Multi-line labels\n'
+        prompt += '   - Footnote references\n'
+        prompt += '   - Any unusual formatting\n\n'
+        prompt += "5. VERIFICATION NOTES:\n"
+        prompt += '   - Key totals and subtotals identified\n'
+        prompt += '   - Balance sheet equation verified (Assets = Liabilities + Equity)\n'
+        prompt += '   - Any discrepancies noticed\n\n'
+        prompt += "Format: Each note should be a clear, standalone sentence explaining one decision or observation.\n\n"
+
+        # EXACT JSON SCHEMA
+        prompt += "REQUIRED JSON OUTPUT SCHEMA - FOLLOW EXACTLY:\n\n"
         prompt += "{\n"
-        prompt += '  "statement_type": "' + statement_type + '",\n'
-        prompt += '  "currency": "EUR/USD/etc",\n'
-        prompt += '  "units": "thousands/millions",\n'
-        prompt += '  "periods": ["2024", "2023", ...],\n'
-        prompt += '  "line_items": [\n'
+        prompt += '  "metadata": {\n'
+        prompt += '    "company_name": "Auto-detected from document",\n'
+        prompt += '    "statement_type": "' + statement_type + '",\n'
+        prompt += '    "reporting_date": "YYYY-MM-DD or period",\n'
+        prompt += '    "currency": "Auto-detected (EUR, USD, etc.)",\n'
+        prompt += '    "original_units": "Auto-detected (thousands, millions, etc.)",\n'
+        prompt += '    "units_multiplier": 1000000,\n'
+        prompt += '    "periods": [\n'
+        prompt += '      {"label": "Exact text from column header", "iso_date": "YYYY-MM-DD", "context": "explanation if ambiguous"}\n'
+        prompt += '    ]\n'
+        prompt += '  },\n'
+        prompt += '  "extraction_notes": [\n'
+        prompt += '    "Document structure: Detected X sections/tables: [list their names]",\n'
+        prompt += '    "Array naming decisions: [explain how you named each array]",\n'
+        prompt += '    "Any other structural decisions, ambiguities, or assumptions"\n'
+        prompt += '  ],\n'
+        prompt += '  "<dynamic_section_name_1>": [\n'
         prompt += '    {\n'
-        prompt += '      "label": "Account name",\n'
-        prompt += '      "level": 1,  // hierarchy level\n'
-        prompt += '      "values": [value_2024, value_2023, ...],\n'
-        prompt += '      "is_total": false\n'
-        prompt += '    }\n'
-        prompt += '  ]\n'
-        prompt += '}'
+        prompt += '      "line_number": 1,\n'
+        prompt += '      "label": "Exact text from document",\n'
+        prompt += '      "level": 1,\n'
+        prompt += '      "is_total": false,\n'
+        prompt += '      "values": {"period1": number, "period2": number},\n'
+        prompt += '      "notes_reference": "Note X.X or null"\n'
+        prompt += '    },\n'
+        prompt += '    ...\n'
+        prompt += '  ],\n'
+        prompt += '  "<dynamic_section_name_2>": [\n'
+        prompt += '    ...\n'
+        prompt += '  ],\n'
+        prompt += '  "...additional sections as needed...": [...]\n'
+        prompt += '}\n\n'
+        prompt += "IMPORTANT: The section names above (<dynamic_section_name_1>, etc.) are PLACEHOLDERS.\n"
+        prompt += "You MUST replace them with actual names based on what you find in the document.\n"
+        prompt += "DO NOT use these placeholder names in your actual output.\n"
+        prompt += "The number of sections is also dynamic - create as many as the document has.\n\n"
+
+        # FINAL ENFORCEMENT - REPEAT KEY RULES
+        prompt += "CRITICAL FINAL REMINDERS:\n"
+        prompt += "✓ Return ONLY the JSON object described above - no other text whatsoever\n"
+        prompt += "✓ All numeric values MUST be numbers (not strings like \"1234\")\n"
+        prompt += "✓ Store values as an OBJECT with ISO DATE keys (YYYY-MM-DD format)\n"
+        prompt += "✓ DO NOT use arrays for values: [value1, value2] is WRONG\n"
+        prompt += "✓ The keys in the values object must EXACTLY match the 'iso_date' field from metadata.periods\n"
+        prompt += "✓ DETECT section structure dynamically from document - do NOT use hardcoded array names\n"
+        prompt += "✓ NAME arrays based on actual section headers found in the document (use snake_case)\n"
+        prompt += "✓ PRESERVE exact labels from document (no inference or interpretation)\n"
+        prompt += "✓ SEPARATE note references from labels (e.g., 'Asset Note 3.1' → label: 'Asset', notes_reference: 'Note 3.1')\n"
+        prompt += "✓ EXTRACT period labels EXACTLY as shown in column headers\n"
+        prompt += "✓ CAPTURE ALL rows including final 'Total' row at bottom of tables\n"
+        prompt += "✓ MAINTAIN hierarchy with proper level indicators (1, 2, 3, 4)\n"
+        prompt += "✓ LOG extraction decisions in extraction_notes array\n"
+        prompt += "✓ MULTIPLY all values by units_multiplier BEFORE storing them\n"
+        prompt += "✓ CONVERT (parentheses) to negative numbers, not strings\n"
+        prompt += "✓ REMOVE all currency symbols (€, $) from values\n"
+        prompt += "✓ REMOVE all thousand separators (commas) from values\n"
+        prompt += "✓ REMOVE decorative dots (....) from labels and values\n"
+        prompt += "✓ Your response MUST start with { and end with }\n"
+        prompt += "✓ DO NOT add any explanations, notes, or commentary outside the JSON\n\n"
+        prompt += "BEGIN EXTRACTION NOW. Output only the JSON:\n"
 
         return prompt
 
