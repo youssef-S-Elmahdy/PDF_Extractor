@@ -3,7 +3,7 @@ Validation module for verifying extraction accuracy
 """
 
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from openai import OpenAI
 from rich.console import Console
 from .prompts import PromptTemplates
@@ -29,6 +29,32 @@ class ExtractionValidator:
         self.client = OpenAI(api_key=api_key)
         self.model = model
         self.prompt_templates = PromptTemplates()
+
+    def _is_multi_statement_format(self, data: Dict[str, Any]) -> bool:
+        """
+        Detect if data is in multi-statement format.
+        Multi-statement format has statement types as top-level keys,
+        each containing their own metadata.
+
+        Args:
+            data: Parsed JSON dictionary
+
+        Returns:
+            True if multi-statement format, False otherwise
+        """
+        # Check if top-level keys look like statement types
+        potential_statements = [
+            'balance_sheet', 'income_statement', 'cash_flow',
+            'notes', 'profit_loss', 'equity', 'statement_of_changes_in_equity'
+        ]
+
+        for key in data.keys():
+            if key in potential_statements:
+                # Verify it has the expected structure
+                if isinstance(data[key], dict) and 'metadata' in data[key]:
+                    return True
+
+        return False
 
     def validate(
         self,
@@ -278,6 +304,7 @@ class ExtractionValidator:
         """
         Validate that extracted financial data meets schema requirements.
         This is a structural validation that checks JSON schema compliance.
+        Supports both single and multi-statement extraction formats.
 
         Args:
             data: Parsed JSON dictionary from extraction
@@ -289,6 +316,76 @@ class ExtractionValidator:
                 - errors: List of specific validation errors
                 - warnings: List of non-critical issues
                 - confidence: Confidence score (0-100)
+        """
+        # Detect if multi-statement format
+        if self._is_multi_statement_format(data):
+            # Multi-statement validation
+            if verbose:
+                console.print("[blue]Validating multi-statement extraction...[/blue]")
+
+            overall_valid = True
+            all_errors = []
+            all_warnings = []
+
+            for statement_key, statement_data in data.items():
+                if verbose:
+                    console.print(f"\n[dim]Validating {statement_key}...[/dim]")
+
+                # Validate each statement separately
+                result = self._validate_single_statement(statement_data, verbose=False)
+
+                if not result['is_valid']:
+                    overall_valid = False
+                    all_errors.extend([f"{statement_key}: {e}" for e in result['errors']])
+
+                all_warnings.extend([f"{statement_key}: {w}" for w in result['warnings']])
+
+            # Calculate overall confidence
+            confidence = 100 if overall_valid else max(0, 100 - len(all_errors) * 10)
+
+            # Display results
+            if verbose:
+                if overall_valid:
+                    console.print(f"\n[green]✓ Multi-statement validation passed (confidence: {confidence}%)[/green]")
+                    if all_warnings:
+                        console.print(f"[yellow]Warnings ({len(all_warnings)}):[/yellow]")
+                        for warning in all_warnings:
+                            console.print(f"  [yellow]• {warning}[/yellow]")
+                else:
+                    console.print(f"\n[red]✗ Multi-statement validation failed (confidence: {confidence}%)[/red]")
+                    console.print(f"[red]Errors ({len(all_errors)}):[/red]")
+                    for error in all_errors:
+                        console.print(f"  [red]• {error}[/red]")
+                    if all_warnings:
+                        console.print(f"[yellow]Warnings ({len(all_warnings)}):[/yellow]")
+                        for warning in all_warnings:
+                            console.print(f"  [yellow]• {warning}[/yellow]")
+
+            return {
+                'is_valid': overall_valid,
+                'errors': all_errors,
+                'warnings': all_warnings,
+                'confidence': confidence
+            }
+        else:
+            # Single statement validation (use existing logic)
+            return self._validate_single_statement(data, verbose)
+
+    def _validate_single_statement(
+        self,
+        data: Dict[str, Any],
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Validate a single statement (extracted from existing validate_financial_json logic).
+        This is the original validation logic, now reusable for both single and multi-statement modes.
+
+        Args:
+            data: Parsed JSON dictionary for a single statement
+            verbose: Whether to print detailed validation results
+
+        Returns:
+            Dictionary containing validation results
         """
         errors = []
         warnings = []
@@ -321,6 +418,8 @@ class ExtractionValidator:
                 warnings.append("Missing metadata.reporting_date (recommended)")
             if "periods" not in metadata:
                 warnings.append("Missing metadata.periods (recommended)")
+            if "dates_covered" not in metadata:
+                warnings.append("Missing metadata.dates_covered (recommended)")
             elif isinstance(metadata["periods"], list) and len(metadata["periods"]) > 0:
                 # Handle both period formats: objects or simple strings
                 first_period = metadata["periods"][0]
@@ -480,6 +579,7 @@ class ExtractionValidator:
         """
         Validate that sections are correctly identified and labeled against the PDF.
         This performs rigorous content validation by re-reading the PDF.
+        Supports both single and multi-statement formats.
 
         Args:
             file_id: OpenAI file ID of the source PDF
@@ -494,6 +594,82 @@ class ExtractionValidator:
                 - warnings: List of non-critical issues
                 - confidence: Confidence score (0-100)
                 - validation_output: Raw LLM validation response
+        """
+        # Detect if multi-statement format
+        if self._is_multi_statement_format(data):
+            if verbose:
+                console.print(f"[blue]Validating multi-statement section structure against PDF...[/blue]")
+
+            # Validate each statement separately
+            overall_valid = True
+            all_errors = []
+            all_warnings = []
+            all_validation_outputs = []
+
+            for statement_key, statement_data in data.items():
+                if verbose:
+                    console.print(f"\n[dim]Validating {statement_key.replace('_', ' ')}...[/dim]")
+
+                result = self._validate_single_statement_structure(
+                    file_id,
+                    statement_data,
+                    statement_key.replace('_', ' '),
+                    verbose=False
+                )
+
+                if not result['is_valid']:
+                    overall_valid = False
+                    all_errors.extend([f"{statement_key}: {e}" for e in result['errors']])
+
+                all_warnings.extend([f"{statement_key}: {w}" for w in result['warnings']])
+                all_validation_outputs.append(f"\n{statement_key}:\n{result.get('validation_output', 'No output')}")
+
+            # Calculate combined confidence
+            confidence = 100 if overall_valid else max(0, 100 - (len(all_errors) * 15) - (len(all_warnings) * 5))
+
+            # Display combined results
+            if verbose:
+                if overall_valid:
+                    console.print(f"\n[green]✓ Multi-statement section structure validation passed (confidence: {confidence}%)[/green]")
+                else:
+                    console.print(f"\n[red]✗ Multi-statement section structure validation failed (confidence: {confidence}%)[/red]")
+                    if all_errors:
+                        console.print(f"[red]Errors ({len(all_errors)}):[/red]")
+                        for error in all_errors:
+                            console.print(f"  [red]• {error}[/red]")
+                    if all_warnings:
+                        console.print(f"[yellow]Warnings ({len(all_warnings)}):[/yellow]")
+                        for warning in all_warnings:
+                            console.print(f"  [yellow]• {warning}[/yellow]")
+
+                # Show detailed outputs
+                console.print(f"\n[dim]Detailed validation responses:[/dim]")
+                for output in all_validation_outputs:
+                    console.print(f"[dim]{output}[/dim]")
+
+            return {
+                'is_valid': overall_valid,
+                'errors': all_errors,
+                'warnings': all_warnings,
+                'confidence': confidence,
+                'validation_output': '\n'.join(all_validation_outputs)
+            }
+        else:
+            # Single statement validation
+            return self._validate_single_statement_structure(
+                file_id, data, statement_type, verbose
+            )
+
+    def _validate_single_statement_structure(
+        self,
+        file_id: str,
+        data: Dict[str, Any],
+        statement_type: str = "financial statement",
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Validate section structure for a single statement.
+        This is the extracted logic from validate_section_structure().
         """
         if verbose:
             console.print(f"[blue]Validating section structure against PDF...[/blue]")
@@ -680,3 +856,131 @@ If INVALID, list specific corrections needed.
                 "warnings": [],
                 "validation_output": None
             }
+
+    def apply_corrections_from_validation(
+        self,
+        data: Dict[str, Any],
+        validation_output: str,
+        verbose: bool = True
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Parse validation output and apply corrections to the data.
+
+        Args:
+            data: Extracted JSON data
+            validation_output: Raw validation output from LLM
+            verbose: Whether to print correction details
+
+        Returns:
+            Tuple of (corrected_data, list_of_corrections_made)
+        """
+        import json
+        from copy import deepcopy
+
+        corrections = []
+        corrected_data = deepcopy(data)
+
+        # Parse validation output for specific correction instructions
+        # Look for patterns like:
+        # - "Earnings per ordinary share" ... "2024: 4.38 (not 4,380,000)"
+        # - Line item values with incorrect multiplier application
+
+        lines = validation_output.split('\n')
+        current_statement = None
+
+        for i, line in enumerate(lines):
+            # Detect statement context (e.g., "1) Income statement EPS unit handling:")
+            if 'Income statement' in line or 'Balance sheet' in line or 'Cash flow' in line:
+                # Extract statement type
+                if 'Income statement' in line:
+                    current_statement = 'income_statement'
+                elif 'Balance sheet' in line:
+                    current_statement = 'balance_sheet'
+                elif 'Cash flow' in line:
+                    current_statement = 'cash_flow'
+
+            # Look for correction patterns like "2024: 4.38 (not 4,380,000)"
+            if 'not ' in line and ':' in line:
+                try:
+                    # Parse the correction
+                    # Example: "- 2024: 4.38 (not 4,380,000)"
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        period_part = parts[0].strip('- ').strip()
+                        value_part = parts[1].split('(not')[0].strip()
+
+                        correct_value = float(value_part.replace(',', ''))
+
+                        # Look for the line item label in previous lines
+                        label = None
+                        for j in range(max(0, i-5), i):
+                            if 'earnings per' in lines[j].lower() or 'diluted' in lines[j].lower() or '"' in lines[j]:
+                                # Extract label
+                                label_match = lines[j].strip('- "').strip('"').strip()
+                                if label_match and len(label_match) > 3:
+                                    label = label_match
+                                    break
+
+                        if label and current_statement:
+                            # Apply correction
+                            correction_made = self._apply_single_correction(
+                                corrected_data,
+                                current_statement,
+                                label,
+                                period_part,
+                                correct_value
+                            )
+
+                            if correction_made:
+                                corrections.append(
+                                    f"Corrected {current_statement}.{label}[{period_part}]: {correct_value}"
+                                )
+                except (ValueError, IndexError):
+                    # Skip malformed correction lines
+                    continue
+
+        if verbose and corrections:
+            console.print(f"\n[yellow]Applied {len(corrections)} corrections from validation:[/yellow]")
+            for corr in corrections:
+                console.print(f"  [yellow]• {corr}[/yellow]")
+
+        return corrected_data, corrections
+
+    def _apply_single_correction(
+        self,
+        data: Dict[str, Any],
+        statement_key: str,
+        label: str,
+        period: str,
+        correct_value: float
+    ) -> bool:
+        """
+        Apply a single correction to the data.
+        Returns True if correction was applied, False otherwise.
+        """
+        if statement_key not in data:
+            return False
+
+        statement_data = data[statement_key]
+
+        # Search through all sections for the line item with matching label
+        for section_name, section_data in statement_data.items():
+            if section_name in ['metadata', 'extraction_notes']:
+                continue
+
+            if not isinstance(section_data, list):
+                continue
+
+            for item in section_data:
+                if isinstance(item, dict) and 'label' in item:
+                    # Fuzzy match label (handles case differences)
+                    if label.lower() in item['label'].lower() or item['label'].lower() in label.lower():
+                        # Found the item, update its value for the period
+                        if 'values' in item and isinstance(item['values'], dict):
+                            # Find matching period key
+                            for period_key in item['values'].keys():
+                                if period in period_key or period_key in period:
+                                    item['values'][period_key] = correct_value
+                                    return True
+
+        return False

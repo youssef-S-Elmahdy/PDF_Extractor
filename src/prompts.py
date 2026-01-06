@@ -2,11 +2,42 @@
 Prompt templates for PDF extraction and validation
 """
 
-from typing import Optional
+from typing import Optional, List
 
 
 class PromptTemplates:
     """Collection of prompt templates for PDF extraction tasks"""
+
+    @staticmethod
+    def _parse_statement_types(statement_type: str) -> List[str]:
+        """
+        Parse statement type string into individual types.
+
+        Examples:
+            "balance sheet" -> ["balance sheet"]
+            "balance sheet and cash flow" -> ["balance sheet", "cash flow"]
+            "balance sheet, income statement, cash flow" -> ["balance sheet", "income statement", "cash flow"]
+            "all" -> ["all"]  # Special case for auto-detection
+
+        Args:
+            statement_type: Statement type string from user
+
+        Returns:
+            List of individual statement types
+        """
+        statement_type_lower = statement_type.lower().strip()
+
+        # Special case: "all" means auto-detect all statements
+        if statement_type_lower == "all":
+            return ["all"]
+
+        # Try multiple delimiters
+        for delimiter in [' and ', ',', ' & ', ';']:
+            if delimiter in statement_type_lower:
+                return [s.strip() for s in statement_type.split(delimiter) if s.strip()]
+
+        # Single statement type
+        return [statement_type]
 
     @staticmethod
     def extraction_prompt(
@@ -105,13 +136,32 @@ class PromptTemplates:
         """
         Production-grade financial statement extraction prompt.
         Engineered for 100% JSON compliance with zero narrative text.
+        Supports both single and multi-statement extraction.
 
         Args:
-            statement_type: Type of financial statement (balance sheet, income statement, cash flow)
+            statement_type: Type of financial statement. Can be:
+                - Single: "balance sheet", "income statement", "cash flow"
+                - Multiple: "balance sheet and cash flow", "balance sheet, income statement"
+                - Auto-detect: "all"
 
         Returns:
             Formatted financial statement extraction prompt with strict JSON enforcement
         """
+        # Parse statement types to detect single vs multi-statement mode
+        statement_types = PromptTemplates._parse_statement_types(statement_type)
+
+        # Determine if multi-statement or single statement mode
+        is_multi_statement = len(statement_types) > 1 or statement_types[0] == "all"
+
+        # Build prompt based on mode
+        if is_multi_statement:
+            return PromptTemplates._build_multi_statement_prompt(statement_types)
+        else:
+            return PromptTemplates._build_single_statement_prompt(statement_types[0])
+
+    @staticmethod
+    def _build_single_statement_prompt(statement_type: str) -> str:
+        """Build prompt for single statement extraction (current behavior)"""
         # CRITICAL: Start with absolute prohibition on narrative
         prompt = "You are a financial data extraction API. You MUST return ONLY valid JSON.\n"
         prompt += "DO NOT include any explanatory text, commentary, notes, or markdown formatting.\n"
@@ -137,23 +187,306 @@ class PromptTemplates:
         prompt += f"  * Does the heading or content clearly indicate it's part of {statement_type}?\n"
         prompt += f"- When in doubt, default to NOT extracting unless you're confident it belongs to {statement_type}\n\n"
 
+        # Add all the common rules
+        prompt += PromptTemplates._build_common_extraction_rules()
+
+        # Single-statement specific JSON schema
+        prompt += "REQUIRED JSON OUTPUT SCHEMA - FOLLOW EXACTLY:\n\n"
+        prompt += "{\n"
+        prompt += '  "metadata": {\n'
+        prompt += '    "company_name": "Auto-detected from document",\n'
+        prompt += '    "statement_type": "' + statement_type + '",\n'
+        prompt += '    "reporting_date": "YYYY-MM-DD or period",\n'
+        prompt += '    "currency": "Auto-detected (EUR, USD, etc.)",\n'
+        prompt += '    "original_units": "Auto-detected (thousands, millions, etc.)",\n'
+        prompt += '    "units_multiplier": 1000000,\n'
+        prompt += '    "dates_covered": "YYYY-MM-DD to YYYY-MM-DD or YYYY-MM-DD, YYYY-MM-DD",\n'
+        prompt += '    "periods": [\n'
+        prompt += '      {"label": "Exact text from column header", "iso_date": "YYYY-MM-DD", "context": "explanation if ambiguous"}\n'
+        prompt += '    ]\n'
+        prompt += '  },\n'
+        prompt += '  "extraction_notes": [\n'
+        prompt += '    "Document structure: Detected X sections/tables: [list their names]",\n'
+        prompt += '    "Array naming decisions: [explain how you named each array]",\n'
+        prompt += '    "Any other structural decisions, ambiguities, or assumptions"\n'
+        prompt += '  ],\n'
+        prompt += '  "<dynamic_section_name_1>": [\n'
+        prompt += '    {\n'
+        prompt += '      "line_number": 1,\n'
+        prompt += '      "label": "Exact text from document",\n'
+        prompt += '      "level": 1,\n'
+        prompt += '      "is_total": false,\n'
+        prompt += '      "values": {"period1": number, "period2": number},\n'
+        prompt += '      "notes_reference": "Note X.X or null"\n'
+        prompt += '    },\n'
+        prompt += '    ...\n'
+        prompt += '  ],\n'
+        prompt += '  "<dynamic_section_name_2>": [\n'
+        prompt += '    ...\n'
+        prompt += '  ],\n'
+        prompt += '  "...additional sections as needed...": [...]\n'
+        prompt += '}\n\n'
+        prompt += "IMPORTANT: The section names above (<dynamic_section_name_1>, etc.) are PLACEHOLDERS.\n"
+        prompt += "You MUST replace them with actual names based on what you find in the document.\n"
+        prompt += "DO NOT use these placeholder names in your actual output.\n"
+        prompt += "The number of sections is also dynamic - create as many as the document has.\n\n"
+
+        # FINAL ENFORCEMENT
+        prompt += "CRITICAL FINAL REMINDERS:\n"
+        prompt += "✓ Return ONLY the JSON object described above - no other text whatsoever\n"
+        prompt += "✓ All numeric values MUST be numbers (not strings like \"1234\")\n"
+        prompt += "✓ Store values as an OBJECT with ISO DATE keys (YYYY-MM-DD format)\n"
+        prompt += "✓ DO NOT use arrays for values: [value1, value2] is WRONG\n"
+        prompt += "✓ The keys in the values object must EXACTLY match the 'iso_date' field from metadata.periods\n"
+        prompt += "✓ DETECT section structure dynamically from document - do NOT use hardcoded array names\n"
+        prompt += "✓ NAME arrays based on actual section headers found in the document (use snake_case)\n"
+        prompt += "✓ PRESERVE exact labels from document (no inference or interpretation)\n"
+        prompt += "✓ SEPARATE note references from labels (e.g., 'Asset Note 3.1' → label: 'Asset', notes_reference: 'Note 3.1')\n"
+        prompt += "✓ EXTRACT period labels EXACTLY as shown in column headers\n"
+        prompt += "✓ CAPTURE ALL rows including final 'Total' row at bottom of tables\n"
+        prompt += "✓ MAINTAIN hierarchy with proper level indicators (1, 2, 3, 4)\n"
+        prompt += "✓ LOG extraction decisions in extraction_notes array\n"
+        prompt += "✓ MULTIPLY all values by units_multiplier BEFORE storing them\n"
+        prompt += "✓ CONVERT (parentheses) to negative numbers, not strings\n"
+        prompt += "✓ REMOVE all currency symbols (€, $) from values\n"
+        prompt += "✓ REMOVE all thousand separators (commas) from values\n"
+        prompt += "✓ REMOVE decorative dots (....) from labels and values\n"
+        prompt += "✓ Your response MUST start with { and end with }\n"
+        prompt += "✓ DO NOT add any explanations, notes, or commentary outside the JSON\n\n"
+        prompt += "BEGIN EXTRACTION NOW. Output only the JSON:\n"
+
+        return prompt
+
+    @staticmethod
+    def _build_multi_statement_prompt(statement_types: List[str]) -> str:
+        """Build prompt for multi-statement extraction"""
+        # CRITICAL: Start with absolute prohibition on narrative
+        prompt = "You are a financial data extraction API. You MUST return ONLY valid JSON.\n"
+        prompt += "DO NOT include any explanatory text, commentary, notes, or markdown formatting.\n"
+        prompt += "DO NOT wrap the JSON in code blocks (no ```json).\n"
+        prompt += "Return raw JSON only, starting with { and ending with }.\n\n"
+
+        # MULTI-STATEMENT MODE
+        if statement_types[0] == "all":
+            prompt += "TASK: AUTO-DETECT and extract ALL financial statements from this PDF.\n\n"
+        else:
+            prompt += f"TASK: Extract ONLY these financial statements: {', '.join(statement_types)}\n\n"
+
+        # ====================================================================
+        # ABSOLUTE NON-NEGOTIABLE REQUIREMENTS - READ THIS FIRST
+        # ====================================================================
+        prompt += "=" * 80 + "\n"
+        prompt += "MANDATORY REQUIREMENTS - EVERY LINE ITEM MUST HAVE ALL THESE FIELDS:\n"
+        prompt += "=" * 80 + "\n\n"
+
+        prompt += "❌ FAILURE TO INCLUDE ANY OF THESE FIELDS WILL CAUSE EXTRACTION FAILURE ❌\n\n"
+
+        prompt += "EVERY SINGLE LINE ITEM IN EVERY SECTION MUST INCLUDE:\n"
+        prompt += "  1. line_number (number) - Sequential number starting at 1 within each section\n"
+        prompt += "  2. label (string) - The exact text label from the document\n"
+        prompt += "  3. level (number) - Hierarchy level: 1 (section header), 2 (main item), 3 (sub-item), 4 (sub-sub-item)\n"
+        prompt += "  4. is_total (boolean) - true if this is a total/subtotal line, false otherwise\n"
+        prompt += "  5. notes_reference (string or null) - Reference to notes (e.g., 'Note 3.1') or null if none\n"
+        prompt += "  6. values (object) - Object with ISO date keys (YYYY-MM-DD) and numeric values\n\n"
+
+        prompt += "METADATA OBJECT FOR EACH STATEMENT MUST INCLUDE:\n"
+        prompt += "  1. company_name (string)\n"
+        prompt += "  2. statement_type (string)\n"
+        prompt += "  3. reporting_date (string in YYYY-MM-DD format)\n"
+        prompt += "  4. currency (string) - e.g., 'EUR', 'USD'\n"
+        prompt += "  5. original_units (string) - e.g., 'EUR m', 'in thousands'\n"
+        prompt += "  6. units_multiplier (number) - REQUIRED! 1000000 for millions, 1000 for thousands, 1 for base units\n"
+        prompt += "  7. periods (array) - Array of period objects with label, iso_date, and context\n\n"
+
+        prompt += "UNIT CONVERSION - ABSOLUTELY CRITICAL:\n"
+        prompt += "  ⚠️  INTELLIGENT MULTIPLIER APPLICATION ⚠️\n\n"
+
+        prompt += "  When a units_multiplier is specified, apply it INTELLIGENTLY.\n"
+        prompt += "  Use your understanding of the data context to determine which values\n"
+        prompt += "  represent monetary amounts in the specified units (multiply these) vs.\n"
+        prompt += "  values already expressed per-unit, as ratios, or as percentages (do NOT multiply these).\n\n"
+
+        prompt += "  Store non-monetary values (per-unit metrics, ratios, percentages, counts)\n"
+        prompt += "  EXACTLY as they appear in the PDF without applying the multiplier.\n\n"
+
+        prompt += "=" * 80 + "\n\n"
+
+        # Now continue with the rest of the instructions
+        if statement_types[0] == "all":
+            prompt += "MULTI-STATEMENT EXTRACTION MODE - AUTO-DETECT:\n"
+            prompt += "- Scan the entire PDF and identify all financial statement types present\n"
+            prompt += "- Common statement types: balance sheet, income statement, cash flow, notes\n"
+            prompt += "- Create SEPARATE top-level objects for EACH statement type found\n"
+        else:
+            prompt += "MULTI-STATEMENT EXTRACTION MODE - SPECIFIC STATEMENTS:\n"
+            prompt += f"- You are extracting: {', '.join(statement_types)}\n"
+            prompt += "- Create SEPARATE top-level objects for EACH statement type\n"
+            prompt += "- Each statement may appear on different pages\n"
+
+        prompt += "\nJSON STRUCTURE - CRITICAL:\n"
+        prompt += "{\n"
+        prompt += '  "<statement_type_1>": {\n'
+        prompt += '    "metadata": {\n'
+        prompt += '      "statement_type": "<statement type name>",\n'
+        prompt += '      "company_name": "...",\n'
+        prompt += '      "reporting_date": "YYYY-MM-DD",\n'
+        prompt += '      "currency": "...",\n'
+        prompt += '      "original_units": "...",\n'
+        prompt += '      "units_multiplier": <number>,  // MANDATORY!\n'
+        prompt += '      "dates_covered": "YYYY-MM-DD to YYYY-MM-DD or YYYY-MM-DD, YYYY-MM-DD",\n'
+        prompt += '      "periods": [...]  // Periods specific to THIS statement\n'
+        prompt += '    },\n'
+        prompt += '    "extraction_notes": [...],\n'
+        prompt += '    "<section_1>": [...],\n'
+        prompt += '    "<section_2>": [...]\n'
+        prompt += '  },\n'
+        prompt += '  "<statement_type_2>": {\n'
+        prompt += '    "metadata": { ... },\n'
+        prompt += '    "extraction_notes": [...],\n'
+        prompt += '    "<sections>": [...]\n'
+        prompt += '  }\n'
+        prompt += '}\n\n'
+
+        prompt += "TOP-LEVEL KEYS - CRITICAL:\n"
+        prompt += "- Use snake_case for statement type keys (e.g., 'balance_sheet', 'cash_flow', 'income_statement')\n"
+        prompt += "- Each statement is a SEPARATE top-level key\n"
+        prompt += "- Each statement contains its OWN metadata object\n"
+        prompt += "- Each statement has its OWN extraction_notes array\n"
+        prompt += "- Each statement has its OWN section arrays\n\n"
+
+        prompt += "STATEMENT SEPARATION - HOW TO IDENTIFY:\n"
+        prompt += "- Look for major headings that indicate statement type (e.g., 'BALANCE SHEET', 'CASH FLOW STATEMENT')\n"
+        prompt += "- Use page breaks and visual separators to distinguish statements\n"
+        prompt += "- Balance sheets typically show Assets and Liabilities\n"
+        prompt += "- Cash flow statements show Operating/Investing/Financing Activities\n"
+        prompt += "- Income statements show Revenue and Expenses\n"
+        prompt += "- Each statement may have different column periods\n\n"
+
+        # Add all the common rules (metadata, period extraction, hierarchy, etc.)
+        prompt += PromptTemplates._build_common_extraction_rules()
+
+        # Add detailed line item schema for multi-statement mode
+        prompt += "DETAILED LINE ITEM SCHEMA FOR MULTI-STATEMENT MODE:\n\n"
+        prompt += "Each statement object must follow this structure:\n\n"
+        prompt += "{\n"
+        prompt += '  "<statement_type>": {  // e.g., "balance_sheet", "cash_flow"\n'
+        prompt += '    "metadata": {\n'
+        prompt += '      "company_name": "string",  // REQUIRED\n'
+        prompt += '      "statement_type": "string",  // REQUIRED\n'
+        prompt += '      "reporting_date": "YYYY-MM-DD",  // REQUIRED - ISO format\n'
+        prompt += '      "currency": "string",  // REQUIRED - e.g., "EUR", "USD"\n'
+        prompt += '      "original_units": "string",  // REQUIRED - e.g., "EUR m", "in thousands"\n'
+        prompt += '      "units_multiplier": number,  // REQUIRED! - 1000000 for millions, 1000 for thousands\n'
+        prompt += '      "dates_covered": "string",  // REQUIRED - Range or comma-separated dates\n'
+        prompt += '      "periods": [  // REQUIRED - Array of period objects\n'
+        prompt += '        {\n'
+        prompt += '          "label": "string",  // REQUIRED - e.g., "31.12.2024"\n'
+        prompt += '          "iso_date": "YYYY-MM-DD",  // REQUIRED - e.g., "2024-12-31"\n'
+        prompt += '          "context": "string"  // REQUIRED - e.g., "Exact date provided"\n'
+        prompt += '        }\n'
+        prompt += '      ]\n'
+        prompt += '    },\n'
+        prompt += '    "extraction_notes": ["string", ...],  // REQUIRED - Array of observations\n'
+        prompt += '    "<dynamic_section_name_1>": [  // e.g., "assets", "operating_activities"\n'
+        prompt += '      {\n'
+        prompt += '        "line_number": number,  // REQUIRED! - Sequential number starting at 1\n'
+        prompt += '        "label": "string",  // REQUIRED! - Exact label from document\n'
+        prompt += '        "level": number,  // REQUIRED! - Hierarchy level (1, 2, 3, etc.)\n'
+        prompt += '        "is_total": boolean,  // REQUIRED! - true for totals/subtotals\n'
+        prompt += '        "notes_reference": "string or null",  // REQUIRED! - e.g., "Note 3.1" or null\n'
+        prompt += '        "values": {  // REQUIRED! - Object with ISO date keys\n'
+        prompt += '          "YYYY-MM-DD": number or null,  // ISO date keys matching metadata.periods[].iso_date\n'
+        prompt += '          "YYYY-MM-DD": number or null  // Values MUST be multiplied by units_multiplier!\n'
+        prompt += '        }\n'
+        prompt += '      },\n'
+        prompt += '      // ... more line items (each MUST have ALL 6 fields above)\n'
+        prompt += '    ],\n'
+        prompt += '    "<dynamic_section_name_2>": [...],\n'
+        prompt += '    // ... more sections\n'
+        prompt += '  },\n'
+        prompt += '  "<another_statement_type>": {\n'
+        prompt += '    "metadata": {...},  // Same required fields as above\n'
+        prompt += '    "extraction_notes": [...],\n'
+        prompt += '    "<sections>": [...]  // Each line item MUST have ALL 6 fields\n'
+        prompt += '  }\n'
+        prompt += '}\n\n'
+
+        prompt += "⚠️  CRITICAL FIELD REQUIREMENTS - NO EXCEPTIONS ALLOWED ⚠️\n\n"
+        prompt += "Each line item MUST include ALL 6 fields:\n"
+        prompt += "  1. line_number (cannot be omitted)\n"
+        prompt += "  2. label (cannot be omitted)\n"
+        prompt += "  3. level (cannot be omitted)\n"
+        prompt += "  4. is_total (cannot be omitted)\n"
+        prompt += "  5. notes_reference (cannot be omitted - use null if no reference)\n"
+        prompt += "  6. values (cannot be omitted)\n\n"
+        prompt += "Metadata MUST include units_multiplier field (cannot be omitted)\n"
+        prompt += "The 'values' object keys MUST be ISO dates (YYYY-MM-DD) matching the 'iso_date' from metadata.periods\n"
+        prompt += "ALL numeric values in 'values' objects MUST be multiplied by units_multiplier BEFORE storing\n"
+        prompt += "Section names are DYNAMIC based on document content (NOT hardcoded)\n\n"
+
+        # Multi-statement specific final reminders - REPEAT CRITICAL REQUIREMENTS
+        prompt += "=" * 80 + "\n"
+        prompt += "FINAL MANDATORY CHECKLIST - VERIFY BEFORE RETURNING JSON:\n"
+        prompt += "=" * 80 + "\n\n"
+
+        prompt += "✓ EVERY line item has ALL 6 required fields: line_number, label, level, is_total, notes_reference, values\n"
+        prompt += "✓ EVERY statement's metadata has units_multiplier field (MANDATORY!)\n"
+        prompt += "✓ Units_multiplier is applied ONLY to relevant monetary amount values\n"
+        prompt += "✓ Per-unit metrics, ratios, and percentages are stored as-is from the PDF\n"
+        prompt += "✓ ALL period keys in values objects are ISO dates (YYYY-MM-DD format)\n"
+        prompt += "✓ Each statement is a SEPARATE top-level key (e.g., 'balance_sheet', 'cash_flow')\n"
+        prompt += "✓ Each statement has its OWN metadata, extraction_notes, and section arrays\n"
+        prompt += "✓ Each statement may have DIFFERENT periods in its metadata\n"
+        prompt += "✓ All numeric values are numbers (not strings like \"1234\")\n"
+        prompt += "✓ Store values as an OBJECT with ISO DATE keys (YYYY-MM-DD format)\n"
+        prompt += "✓ PRESERVE exact labels from document (no inference or interpretation)\n"
+        prompt += "✓ MAINTAIN hierarchy with proper level indicators (1, 2, 3, 4)\n"
+        prompt += "✓ Return ONLY JSON - no explanations, notes, or commentary outside the JSON\n"
+        prompt += "✓ Your response MUST start with { and end with }\n\n"
+
+        prompt += "=" * 80 + "\n"
+        prompt += "IF YOU MISS ANY REQUIRED FIELD, THE EXTRACTION WILL FAIL VALIDATION!\n"
+        prompt += "=" * 80 + "\n\n"
+
+        prompt += "BEGIN EXTRACTION NOW. Output only the JSON:\n"
+
+        return prompt
+
+    @staticmethod
+    def _build_common_extraction_rules() -> str:
+        """Build common extraction rules shared by both single and multi-statement modes"""
+        prompt = ""
+
         # METADATA EXTRACTION RULES
         prompt += "METADATA EXTRACTION RULES:\n"
         prompt += "1. AUTO-DETECT company name from document header/title/footer\n"
         prompt += "2. AUTO-DETECT reporting date/period (e.g., 'December 31, 2024' or 'Q4 2024')\n"
         prompt += "3. AUTO-DETECT currency (EUR, USD, GBP, etc.) from document symbols/text\n"
-        prompt += "4. AUTO-DETECT units from table headers (thousands, millions, billions, etc.)\n\n"
+        prompt += "4. AUTO-DETECT units from table headers (thousands, millions, billions, etc.)\n"
+        prompt += "5. CREATE dates_covered field by analyzing the periods:\n"
+        prompt += "   - If periods form a consecutive sequence (quarterly/monthly), use range format:\n"
+        prompt += "     'YYYY-MM-DD to YYYY-MM-DD' (e.g., '2024-03-31 to 2024-12-31')\n"
+        prompt += "   - If periods are discrete/non-consecutive, use comma-separated format:\n"
+        prompt += "     'YYYY-MM-DD, YYYY-MM-DD' (e.g., '2023-12-31, 2024-12-31')\n"
+        prompt += "   - Use your judgment to determine if periods are consecutive based on the dates\n\n"
 
         # UNIT CONVERSION RULES (CRITICAL)
-        prompt += "UNIT CONVERSION RULES - EXTREMELY IMPORTANT:\n"
+        prompt += "UNIT CONVERSION RULES - INTELLIGENT MULTIPLIER APPLICATION:\n\n"
+
+        prompt += "CRITICAL NOTE: When a units_multiplier is specified (e.g., 1,000,000 for millions), "
+        prompt += "apply it INTELLIGENTLY to only those values that represent monetary amounts in those units.\n\n"
+
+        prompt += "Use your understanding of the data and context to determine:\n"
+        prompt += "  • Which values are monetary amounts measured in the document's specified units "
+        prompt += "(these should be multiplied)\n"
+        prompt += "  • Which values are already expressed per-unit (per share, per item, etc.), "
+        prompt += "as ratios, as percentages, or as counts (these should NOT be multiplied)\n\n"
+
+        prompt += "Store values that should not be multiplied EXACTLY as they appear in the PDF.\n"
+        prompt += "Apply the multiplier only to values representing absolute monetary amounts.\n\n"
+
         prompt += "If the document states 'in thousands', 'in millions', or 'in billions':\n"
-        prompt += "- You MUST MULTIPLY all numeric values to convert them to base units (actual full numbers)\n"
-        prompt += "- Examples of correct conversion:\n"
-        prompt += "  * Document shows '201,680' with header 'in EUR millions' → store as 201680000000\n"
-        prompt += "  * Document shows '1,234' with '(in thousands)' → store as 1234000\n"
-        prompt += "  * Document shows '456' with '(in millions)' → store as 456000000\n"
-        prompt += "  * Document shows '789' with '(in billions)' → store as 789000000000\n"
-        prompt += "- Set 'units_multiplier' field to show what you multiplied by:\n"
+        prompt += "- Set 'units_multiplier' field to show the multiplier:\n"
         prompt += "  * 1000 for thousands\n"
         prompt += "  * 1000000 for millions\n"
         prompt += "  * 1000000000 for billions\n"
@@ -486,70 +819,6 @@ class PromptTemplates:
         prompt += '   - Balance sheet equation verified (Assets = Liabilities + Equity)\n'
         prompt += '   - Any discrepancies noticed\n\n'
         prompt += "Format: Each note should be a clear, standalone sentence explaining one decision or observation.\n\n"
-
-        # EXACT JSON SCHEMA
-        prompt += "REQUIRED JSON OUTPUT SCHEMA - FOLLOW EXACTLY:\n\n"
-        prompt += "{\n"
-        prompt += '  "metadata": {\n'
-        prompt += '    "company_name": "Auto-detected from document",\n'
-        prompt += '    "statement_type": "' + statement_type + '",\n'
-        prompt += '    "reporting_date": "YYYY-MM-DD or period",\n'
-        prompt += '    "currency": "Auto-detected (EUR, USD, etc.)",\n'
-        prompt += '    "original_units": "Auto-detected (thousands, millions, etc.)",\n'
-        prompt += '    "units_multiplier": 1000000,\n'
-        prompt += '    "periods": [\n'
-        prompt += '      {"label": "Exact text from column header", "iso_date": "YYYY-MM-DD", "context": "explanation if ambiguous"}\n'
-        prompt += '    ]\n'
-        prompt += '  },\n'
-        prompt += '  "extraction_notes": [\n'
-        prompt += '    "Document structure: Detected X sections/tables: [list their names]",\n'
-        prompt += '    "Array naming decisions: [explain how you named each array]",\n'
-        prompt += '    "Any other structural decisions, ambiguities, or assumptions"\n'
-        prompt += '  ],\n'
-        prompt += '  "<dynamic_section_name_1>": [\n'
-        prompt += '    {\n'
-        prompt += '      "line_number": 1,\n'
-        prompt += '      "label": "Exact text from document",\n'
-        prompt += '      "level": 1,\n'
-        prompt += '      "is_total": false,\n'
-        prompt += '      "values": {"period1": number, "period2": number},\n'
-        prompt += '      "notes_reference": "Note X.X or null"\n'
-        prompt += '    },\n'
-        prompt += '    ...\n'
-        prompt += '  ],\n'
-        prompt += '  "<dynamic_section_name_2>": [\n'
-        prompt += '    ...\n'
-        prompt += '  ],\n'
-        prompt += '  "...additional sections as needed...": [...]\n'
-        prompt += '}\n\n'
-        prompt += "IMPORTANT: The section names above (<dynamic_section_name_1>, etc.) are PLACEHOLDERS.\n"
-        prompt += "You MUST replace them with actual names based on what you find in the document.\n"
-        prompt += "DO NOT use these placeholder names in your actual output.\n"
-        prompt += "The number of sections is also dynamic - create as many as the document has.\n\n"
-
-        # FINAL ENFORCEMENT - REPEAT KEY RULES
-        prompt += "CRITICAL FINAL REMINDERS:\n"
-        prompt += "✓ Return ONLY the JSON object described above - no other text whatsoever\n"
-        prompt += "✓ All numeric values MUST be numbers (not strings like \"1234\")\n"
-        prompt += "✓ Store values as an OBJECT with ISO DATE keys (YYYY-MM-DD format)\n"
-        prompt += "✓ DO NOT use arrays for values: [value1, value2] is WRONG\n"
-        prompt += "✓ The keys in the values object must EXACTLY match the 'iso_date' field from metadata.periods\n"
-        prompt += "✓ DETECT section structure dynamically from document - do NOT use hardcoded array names\n"
-        prompt += "✓ NAME arrays based on actual section headers found in the document (use snake_case)\n"
-        prompt += "✓ PRESERVE exact labels from document (no inference or interpretation)\n"
-        prompt += "✓ SEPARATE note references from labels (e.g., 'Asset Note 3.1' → label: 'Asset', notes_reference: 'Note 3.1')\n"
-        prompt += "✓ EXTRACT period labels EXACTLY as shown in column headers\n"
-        prompt += "✓ CAPTURE ALL rows including final 'Total' row at bottom of tables\n"
-        prompt += "✓ MAINTAIN hierarchy with proper level indicators (1, 2, 3, 4)\n"
-        prompt += "✓ LOG extraction decisions in extraction_notes array\n"
-        prompt += "✓ MULTIPLY all values by units_multiplier BEFORE storing them\n"
-        prompt += "✓ CONVERT (parentheses) to negative numbers, not strings\n"
-        prompt += "✓ REMOVE all currency symbols (€, $) from values\n"
-        prompt += "✓ REMOVE all thousand separators (commas) from values\n"
-        prompt += "✓ REMOVE decorative dots (....) from labels and values\n"
-        prompt += "✓ Your response MUST start with { and end with }\n"
-        prompt += "✓ DO NOT add any explanations, notes, or commentary outside the JSON\n\n"
-        prompt += "BEGIN EXTRACTION NOW. Output only the JSON:\n"
 
         return prompt
 

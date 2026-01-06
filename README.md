@@ -1,6 +1,6 @@
 # PDF Extractor
 
-A general-purpose PDF extraction tool using OpenAI's API (GPT-4 or GPT-5.2) that can extract structured information from PDFs based on natural language prompts.
+A general-purpose PDF extraction tool using OpenAI's API (GPT-4 or GPT-5-mini) that can extract structured information from PDFs based on natural language prompts.
 
 ## Features
 
@@ -104,8 +104,8 @@ Extract data from a single PDF file.
 - `--format, -f`: Output format(s) - can specify multiple (default: `json`)
   - Available formats: `json`, `txt`, `csv`, `md`
 - `--validate, -v`: Validate extracted data (flag)
-- `--model, -m`: Model to use (default: `gpt-5.2`)
-  - Options: `gpt-4`, `gpt-5.2`
+- `--model, -m`: Model to use (default: `gpt-5-mini`)
+  - Options: `gpt-4`, `gpt-5-mini`
 - `--api-key`: OpenAI API key (or set `OPENAI_API_KEY` env var)
 - `--preview/--no-preview`: Show/hide preview of extracted data (default: show)
 
@@ -121,8 +121,8 @@ python main.py extract report.pdf -t financial --validate
 # Save in multiple formats
 python main.py extract data.pdf -p "Extract tables" -f json -f csv -f md -o results
 
-# Use GPT-4 instead of GPT-5.2
-python main.py extract document.pdf -p "Extract summary" -m gpt-4
+# Use GPT-4 instead of GPT-5-mini
+python main.py extract document.pdf -p "Extract summary" -m gpt-5-mini
 ```
 
 ### `batch` Command
@@ -136,7 +136,7 @@ Process multiple PDFs in a directory.
 - `--prompt, -p`: Extraction prompt for all PDFs (required)
 - `--output-dir, -o`: Output directory (default: `output`)
 - `--format, -f`: Output format (default: `json`)
-- `--model, -m`: Model to use (default: `gpt-5.2`)
+- `--model, -m`: Model to use (default: `gpt-5-mini`)
 - `--api-key`: OpenAI API key
 
 **Example:**
@@ -192,7 +192,7 @@ PDF_Extractor/
 ## How It Works
 
 1. **Upload**: PDF is uploaded to OpenAI Files API
-2. **Extract**: File + prompt sent to OpenAI model (GPT-4 or GPT-5.2)
+2. **Extract**: File + prompt sent to OpenAI model (GPT-4 or GPT-5-mini)
 3. **Validate** (optional): Second API call verifies accuracy
 4. **Format**: Data formatted and saved in requested format(s)
 
@@ -339,4 +339,4 @@ MIT License - feel free to use and modify as needed.
 
 ## Acknowledgments
 
-Powered by OpenAI's API (GPT-4 and GPT-5.2).
+Powered by OpenAI's API (GPT-4 and GPT-5-mini).

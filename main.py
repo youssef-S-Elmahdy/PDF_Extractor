@@ -36,13 +36,13 @@ def extract(
     pdf_path: str = typer.Argument(..., help="Path to the PDF file"),
     prompt: Optional[str] = typer.Option(None, "--prompt", "-p", help="Custom extraction prompt"),
     template: Optional[str] = typer.Option(None, "--template", "-t", help="Use a prompt template (table, financial, custom)"),
-    statement_type: str = typer.Option("balance sheet", "--statement-type", "-s", help="Type of financial statement (balance sheet, income statement, cash flow)"),
+    statement_type: str = typer.Option("balance sheet", "--statement-type", "-s", help="Type(s) of financial statement. Examples: 'balance sheet', 'balance sheet and cash flow', 'all'"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output filename (without extension)"),
     format: List[str] = typer.Option(["json"], "--format", "-f", help="Output format(s): json, txt, csv, md"),
     validate: bool = typer.Option(False, "--validate", "-v", help="Validate extracted data"),
     validate_schema: bool = typer.Option(True, "--validate-schema/--no-validate-schema", help="Validate JSON schema compliance"),
     enforce_json: bool = typer.Option(True, "--enforce-json/--no-enforce-json", help="Enforce strict JSON-only output"),
-    model: str = typer.Option("gpt-5-mini", "--model", "-m", help="Model to use (gpt-4, gpt-5.2)"),
+    model: str = typer.Option("gpt-5-mini", "--model", "-m", help="Model to use (gpt-5-mini)"),
     api_key: Optional[str] = typer.Option(None, "--api-key", help="OpenAI API key (or set OPENAI_API_KEY env var)"),
     preview: bool = typer.Option(True, "--preview/--no-preview", help="Show preview of extracted data")
 ):
@@ -191,6 +191,40 @@ def extract(
                 data_type=statement_type if template == "financial" else "data",
                 extracted_data=extracted_data
             )
+
+            # Apply corrections if validation found issues
+            if not validation_result["is_valid"] and validation_result.get("validation_output"):
+                console.print("\n[yellow]Attempting to apply corrections from validation...[/yellow]")
+                corrected_result, corrections = validator.apply_corrections_from_validation(
+                    data=result,
+                    validation_output=validation_result["validation_output"],
+                    verbose=True
+                )
+
+                if corrections:
+                    # Update result with corrected data
+                    result = corrected_result
+                    console.print(f"[green]✓ Applied {len(corrections)} corrections[/green]")
+
+                    # Re-run validation to confirm corrections
+                    console.print("\n[dim]Re-validating after corrections...[/dim]")
+                    import json
+                    revalidation_result = validator.validate(
+                        file_id=file_id,
+                        data_type=statement_type if template == "financial" else "data",
+                        extracted_data=json.dumps(result, indent=2)
+                    )
+
+                    # Display updated validation results
+                    if revalidation_result["is_valid"]:
+                        console.print(f"[green]✓ Validation passed after corrections (confidence: {revalidation_result.get('confidence', 'N/A')}%)[/green]")
+                    else:
+                        console.print(f"[yellow]⚠ Some issues remain (confidence: {revalidation_result.get('confidence', 'N/A')}%)[/yellow]")
+
+                    # Update extracted_data with corrected result for saving
+                    extracted_data = json.dumps(result, indent=2)
+                else:
+                    console.print("[yellow]⚠ No corrections could be automatically applied[/yellow]")
 
             if not validation_result["is_valid"]:
                 console.print("[yellow]Warning: Validation found potential issues[/yellow]")
