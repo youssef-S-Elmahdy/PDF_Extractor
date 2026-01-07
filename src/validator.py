@@ -42,17 +42,12 @@ class ExtractionValidator:
         Returns:
             True if multi-statement format, False otherwise
         """
-        # Check if top-level keys look like statement types
-        potential_statements = [
-            'balance_sheet', 'income_statement', 'cash_flow',
-            'notes', 'profit_loss', 'equity', 'statement_of_changes_in_equity'
-        ]
-
-        for key in data.keys():
-            if key in potential_statements:
-                # Verify it has the expected structure
-                if isinstance(data[key], dict) and 'metadata' in data[key]:
-                    return True
+        # Any top-level object (except metadata/extraction_notes) that contains metadata counts
+        for key, value in data.items():
+            if key in ["metadata", "extraction_notes"]:
+                continue
+            if isinstance(value, dict) and "metadata" in value:
+                return True
 
         return False
 
@@ -371,6 +366,256 @@ class ExtractionValidator:
             # Single statement validation (use existing logic)
             return self._validate_single_statement(data, verbose)
 
+    def normalize_financial_json(
+        self,
+        data: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """
+        Normalize common LLM schema/shape drift for financial extraction outputs.
+
+        This is a deterministic, non-LLM post-processor that makes outputs
+        more consistent and schema-compliant without changing numeric content.
+        """
+        from copy import deepcopy
+
+        normalized = deepcopy(data)
+        fixes: List[str] = []
+
+        iso_date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+        def _to_snake_case(text: str) -> str:
+            text = re.sub(r"[^\w\s-]", "", text or "").strip().lower()
+            return re.sub(r"[\s-]+", "_", text)
+
+        def _keys_look_like_iso_dates(values_obj: Dict[str, Any]) -> bool:
+            keys = list(values_obj.keys())
+            return bool(keys) and all(isinstance(k, str) and iso_date_pattern.match(k) for k in keys)
+
+        def _detect_matrix_table(statement_data: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
+            columns = metadata.get("columns")
+            if not isinstance(columns, list) or len(columns) == 0:
+                return False
+
+            # If any line-item values keys are not ISO dates, treat this statement as a matrix table.
+            for array_name, value in statement_data.items():
+                if array_name in ["metadata", "extraction_notes"]:
+                    continue
+                if not isinstance(value, list):
+                    continue
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    values_obj = item.get("values")
+                    if isinstance(values_obj, dict) and values_obj:
+                        return not _keys_look_like_iso_dates(values_obj)
+            return False
+
+        def normalize_statement(statement_data: Dict[str, Any], statement_key: str) -> Dict[str, Any]:
+            if not isinstance(statement_data, dict):
+                return statement_data
+
+            metadata = statement_data.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                statement_data["metadata"] = metadata
+                fixes.append(f"{statement_key}: added missing metadata object")
+
+            # Move top-level column definitions into metadata.columns
+            if "columns" in statement_data and isinstance(statement_data["columns"], list):
+                if "columns" not in metadata or not isinstance(metadata.get("columns"), list) or len(metadata.get("columns") or []) == 0:
+                    metadata["columns"] = statement_data["columns"]
+                    fixes.append(f"{statement_key}: moved top-level columns -> metadata.columns")
+                del statement_data["columns"]
+                fixes.append(f"{statement_key}: removed forbidden top-level columns")
+
+            if "metadata_columns" in statement_data and isinstance(statement_data["metadata_columns"], list):
+                if "columns" not in metadata or not isinstance(metadata.get("columns"), list) or len(metadata.get("columns") or []) == 0:
+                    # Some model variants use {header,label}; normalize to {key,label}
+                    cols = []
+                    for col in statement_data["metadata_columns"]:
+                        if isinstance(col, dict):
+                            cols.append({
+                                "key": col.get("key") or col.get("snake_case") or col.get("id") or "",
+                                "label": col.get("label") or col.get("header") or ""
+                            })
+                    metadata["columns"] = cols
+                    fixes.append(f"{statement_key}: moved metadata_columns -> metadata.columns")
+                del statement_data["metadata_columns"]
+                fixes.append(f"{statement_key}: removed forbidden metadata_columns")
+
+            # Normalize metadata.columns entries (accept drift: header/name -> label; derive missing key/label)
+            if isinstance(metadata.get("columns"), list):
+                normalized_cols: List[Dict[str, Any]] = []
+                for idx, col in enumerate(metadata["columns"]):
+                    if not isinstance(col, dict):
+                        continue
+                    label = col.get("label") or col.get("header") or col.get("name") or ""
+                    key = col.get("key") or ""
+                    if not isinstance(label, str):
+                        label = ""
+                    if not isinstance(key, str):
+                        key = ""
+                    label = label.strip()
+                    key = key.strip()
+                    if not key and label:
+                        key = _to_snake_case(label)
+                        fixes.append(f"{statement_key}: derived metadata.columns[{idx}].key from label")
+                    if not label and key:
+                        derived = key.replace("_", " ").strip()
+                        label = derived[:1].upper() + derived[1:] if derived else ""
+                        fixes.append(f"{statement_key}: derived metadata.columns[{idx}].label from key")
+                    normalized_cols.append({"key": key, "label": label})
+                if normalized_cols:
+                    metadata["columns"] = normalized_cols
+                    fixes.append(f"{statement_key}: normalized metadata.columns entries to {{key,label}}")
+
+            # Decide axis robustly (matrix vs time-series) based on values keys
+            is_matrix = _detect_matrix_table(statement_data, metadata)
+            if is_matrix:
+                if metadata.get("periods") != []:
+                    metadata["periods"] = []
+                    fixes.append(f"{statement_key}: forced metadata.periods = [] for matrix table")
+            else:
+                # If time-series, avoid axis ambiguity by removing metadata.columns when periods are present
+                if isinstance(metadata.get("periods"), list) and len(metadata.get("periods") or []) > 0 and isinstance(metadata.get("columns"), list) and len(metadata.get("columns") or []) > 0:
+                    del metadata["columns"]
+                    fixes.append(f"{statement_key}: removed metadata.columns for time-series table (axis ambiguity)")
+
+            # Matrix tables: normalize line-array naming (rows -> lines)
+            if is_matrix and "lines" not in statement_data and isinstance(statement_data.get("rows"), list):
+                statement_data["lines"] = statement_data["rows"]
+                del statement_data["rows"]
+                fixes.append(f"{statement_key}: renamed rows -> lines for matrix table")
+
+            # Build column label->key mapping for matrix tables
+            column_label_to_key: Dict[str, str] = {}
+            column_keys = set()
+            if isinstance(metadata.get("columns"), list):
+                for col in metadata["columns"]:
+                    if not isinstance(col, dict):
+                        continue
+                    key = col.get("key")
+                    label = col.get("label")
+                    if isinstance(key, str) and key:
+                        column_keys.add(key)
+                    if isinstance(label, str) and isinstance(key, str) and key:
+                        column_label_to_key[label.strip().lower()] = key
+
+            def normalize_line_item(item: Dict[str, Any], idx: int, array_name: str) -> Dict[str, Any]:
+                if not isinstance(item, dict):
+                    return item
+
+                # Remove known drift keys
+                if "line_kind" in item:
+                    item.pop("line_kind", None)
+                    fixes.append(f"{statement_key}: removed unsupported field {array_name}[{idx}].line_kind")
+
+                # For non-position rows, row_as_of should be null (dates belong in row_period)
+                if item.get("row_kind") in ["movement", "subtotal"] and isinstance(item.get("row_as_of"), str):
+                    item["row_as_of"] = None
+                    fixes.append(f"{statement_key}: set row_as_of=null for non-position {array_name}[{idx}]")
+
+                # Ensure required fields
+                if "line_number" not in item or not isinstance(item.get("line_number"), int):
+                    item["line_number"] = idx + 1
+                    fixes.append(f"{statement_key}: set missing/invalid line_number for {array_name}[{idx}]")
+
+                if "label" not in item or not isinstance(item.get("label"), str) or not item.get("label"):
+                    fallback = item.get("row_description") if isinstance(item.get("row_description"), str) and item.get("row_description") else f"unknown_line_{item['line_number']}"
+                    item["label"] = str(fallback)
+                    fixes.append(f"{statement_key}: set missing label for {array_name}[{idx}]")
+
+                if "level" not in item or not isinstance(item.get("level"), int):
+                    item["level"] = 0
+                    fixes.append(f"{statement_key}: set missing level for {array_name}[{idx}]")
+
+                # Position rows are not totals unless explicitly labeled as total/subtotal
+                if isinstance(item.get("is_total"), bool) and item.get("row_kind") == "position":
+                    label_lower = str(item.get("label", "")).lower()
+                    if "total" not in label_lower and "sub-total" not in label_lower and "subtotal" not in label_lower:
+                        if item["is_total"] is True:
+                            item["is_total"] = False
+                            fixes.append(f"{statement_key}: corrected is_total=false for position {array_name}[{idx}]")
+
+                if "is_total" not in item or not isinstance(item.get("is_total"), bool):
+                    label_lower = str(item.get("label", "")).lower()
+                    row_kind = item.get("row_kind")
+                    is_total = False
+                    if row_kind == "subtotal":
+                        is_total = True
+                    elif "total" in label_lower or "sub-total" in label_lower or "subtotal" in label_lower:
+                        is_total = True
+                    item["is_total"] = is_total
+                    fixes.append(f"{statement_key}: set missing is_total for {array_name}[{idx}]")
+
+                if "notes_reference" not in item or not isinstance(item.get("notes_reference"), list):
+                    item["notes_reference"] = []
+                    fixes.append(f"{statement_key}: set missing notes_reference for {array_name}[{idx}]")
+
+                # Normalize row_as_of type (must be ISO date string or null)
+                if "row_as_of" in item and isinstance(item.get("row_as_of"), dict):
+                    # Some outputs incorrectly copy row_period into row_as_of
+                    if item.get("row_period") is None and set(item["row_as_of"].keys()) >= {"start", "end"}:
+                        item["row_period"] = item["row_as_of"]
+                        fixes.append(f"{statement_key}: moved dict row_as_of -> row_period for {array_name}[{idx}]")
+                    item["row_as_of"] = None
+                    fixes.append(f"{statement_key}: coerced dict row_as_of -> null for {array_name}[{idx}]")
+
+                # Values normalization
+                if "values" not in item or not isinstance(item.get("values"), dict):
+                    item["values"] = {}
+                    fixes.append(f"{statement_key}: set missing values object for {array_name}[{idx}]")
+
+                # Matrix: remap values keys from human labels to metadata.columns keys if possible
+                if is_matrix and item.get("values"):
+                    values_obj = item["values"]
+                    remapped: Dict[str, Any] = {}
+                    did_remap = False
+                    for k, v in values_obj.items():
+                        if k in column_keys:
+                            remapped[k] = v
+                            continue
+                        if isinstance(k, str):
+                            mapped = column_label_to_key.get(k.strip().lower())
+                            if mapped:
+                                remapped[mapped] = v
+                                did_remap = True
+                            else:
+                                remapped[k] = v
+                        else:
+                            remapped[str(k)] = v
+                    if did_remap:
+                        item["values"] = remapped
+                        fixes.append(f"{statement_key}: remapped values keys to metadata.columns keys for {array_name}[{idx}]")
+
+                return item
+
+            # Normalize all arrays of line items (any list of dicts with a values object)
+            for array_name, value in list(statement_data.items()):
+                if array_name in ["metadata", "extraction_notes"]:
+                    continue
+                if not isinstance(value, list) or len(value) == 0:
+                    continue
+                if not all(isinstance(x, dict) for x in value):
+                    continue
+                if not any(isinstance(x.get("values"), dict) for x in value if isinstance(x, dict)):
+                    continue
+
+                statement_data[array_name] = [
+                    normalize_line_item(item, idx, array_name) for idx, item in enumerate(value)
+                ]
+
+            return statement_data
+
+        if self._is_multi_statement_format(normalized):
+            for statement_key, statement_data in list(normalized.items()):
+                if isinstance(statement_data, dict) and "metadata" in statement_data:
+                    normalized[statement_key] = normalize_statement(statement_data, statement_key)
+        else:
+            normalized = normalize_statement(normalized, "root")
+
+        return normalized, fixes
+
     def _validate_single_statement(
         self,
         data: Dict[str, Any],
@@ -440,6 +685,20 @@ class ExtractionValidator:
                         # 'context' field is optional
                 # else: Old format with simple strings ["2024", "2023"] - still valid for backward compatibility
 
+            # Optional component columns for matrix-style tables (e.g., equity reconciliation)
+            if "columns" in metadata:
+                if not isinstance(metadata["columns"], list):
+                    errors.append(f"metadata.columns must be an array, got {type(metadata['columns']).__name__}")
+                else:
+                    for i, col in enumerate(metadata["columns"]):
+                        if not isinstance(col, dict):
+                            errors.append(f"metadata.columns[{i}] must be an object with 'key' and 'label'")
+                            continue
+                        if "key" not in col or not isinstance(col.get("key"), str) or not col.get("key"):
+                            errors.append(f"metadata.columns[{i}].key is required and must be a non-empty string")
+                        if "label" not in col or not isinstance(col.get("label"), str) or not col.get("label"):
+                            errors.append(f"metadata.columns[{i}].label is required and must be a non-empty string")
+
             # Validate units_multiplier value
             if "units_multiplier" in metadata:
                 valid_multipliers = [1, 1000, 1000000, 1000000000]
@@ -449,13 +708,25 @@ class ExtractionValidator:
                         f"(expected one of: {valid_multipliers})"
                     )
 
+            # Warn if both periods and columns are populated (axis ambiguity)
+            if isinstance(metadata.get("periods"), list) and len(metadata.get("periods")) > 0 and isinstance(metadata.get("columns"), list) and len(metadata.get("columns")) > 0:
+                warnings.append("metadata.periods and metadata.columns are both populated; expected exactly one axis (periods for time-series OR columns for matrix tables)")
+
         # === STRUCTURE VALIDATION ===
         # Generic validation - check that there are data arrays (not specific field names)
+
+        # Hard-stop on wrapper patterns that break reconstruction
+        if "sections" in data:
+            errors.append("Found 'sections' wrapper; expected top-level arrays of line items (no sections/line_items nesting)")
+        if "metadata_columns" in data:
+            errors.append("Found 'metadata_columns'; columns must be stored in metadata.columns (not as a top-level array)")
+        if "columns" in data:
+            errors.append("Found top-level 'columns'; columns must be stored in metadata.columns (not as a top-level array)")
 
         # Get all top-level arrays (excluding metadata and extraction_notes)
         top_level_arrays = [
             k for k in data.keys()
-            if k not in ["metadata", "extraction_notes"] and isinstance(data[k], list)
+            if k not in ["metadata", "extraction_notes", "sections", "metadata_columns", "columns"] and isinstance(data[k], list)
         ]
 
         if len(top_level_arrays) == 0:
@@ -493,6 +764,16 @@ class ExtractionValidator:
                 if "is_total" in item and not isinstance(item["is_total"], bool):
                     errors.append(f"{item_ref}: 'is_total' must be boolean, got {type(item['is_total']).__name__}")
 
+                if "notes_reference" in item:
+                    if isinstance(item["notes_reference"], str):
+                        warnings.append(f"{item_ref}: 'notes_reference' should be array of strings, got string")
+                    elif item["notes_reference"] is not None and not isinstance(item["notes_reference"], list):
+                        errors.append(f"{item_ref}: 'notes_reference' must be array or null, got {type(item['notes_reference']).__name__}")
+                    elif isinstance(item["notes_reference"], list):
+                        for note in item["notes_reference"]:
+                            if not isinstance(note, str):
+                                errors.append(f"{item_ref}: 'notes_reference' entries must be strings, got {type(note).__name__}")
+
                 if "values" in item:
                     # Values should now be an object (dict) with period keys, not an array
                     if not isinstance(item["values"], dict):
@@ -506,31 +787,51 @@ class ExtractionValidator:
                                     f"got {type(val).__name__}: {val}"
                                 )
 
-                        # Check that period keys match metadata.periods and are valid ISO dates
-                        if "metadata" in data and "periods" in data["metadata"]:
-                            # Extract expected period keys based on format
-                            metadata_periods = data["metadata"]["periods"]
-                            if metadata_periods and isinstance(metadata_periods[0], dict):
-                                # New format: extract "iso_date" values
-                                expected_periods = set(p.get("iso_date") for p in metadata_periods if "iso_date" in p)
-                            else:
-                                # Old format: use strings directly (backward compatibility)
-                                expected_periods = set(metadata_periods)
+                        # Check that value keys match the declared axis (periods vs component columns)
+                        if "metadata" in data:
+                            metadata_obj = data.get("metadata", {})
+                            metadata_periods = metadata_obj.get("periods")
+                            metadata_columns = metadata_obj.get("columns")
+                            actual_keys = set(item["values"].keys())
 
-                            actual_periods = set(item["values"].keys())
-
-                            # Validate that all actual period keys are ISO dates (YYYY-MM-DD format)
                             iso_date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
-                            for period_key in actual_periods:
-                                if not iso_date_pattern.match(period_key):
-                                    errors.append(
-                                        f"{item_ref}: Period key '{period_key}' is not in ISO date format (YYYY-MM-DD)"
-                                    )
+                            all_keys_are_iso_dates = all(iso_date_pattern.match(k) for k in actual_keys)
 
-                            if expected_periods != actual_periods:
-                                warnings.append(
-                                    f"{item_ref}: Period keys {actual_periods} don't match metadata.periods iso_date values {expected_periods}"
+                            # Axis B: component/measures as columns (matrix tables)
+                            if isinstance(metadata_columns, list) and len(metadata_columns) > 0 and not all_keys_are_iso_dates:
+                                expected_keys = set(
+                                    c.get("key") for c in metadata_columns
+                                    if isinstance(c, dict) and c.get("key")
                                 )
+                                if expected_keys and not actual_keys.issubset(expected_keys):
+                                    extra = sorted(actual_keys - expected_keys)
+                                    errors.append(
+                                        f"{item_ref}: Value keys contain unknown column keys {extra} (not in metadata.columns)"
+                                    )
+                                if isinstance(metadata_periods, list) and len(metadata_periods) > 0:
+                                    warnings.append(f"{item_ref}: Detected matrix-style value keys but metadata.periods is populated; expected metadata.periods to be [] for matrix tables")
+
+                            # Axis A: time periods as columns
+                            elif isinstance(metadata_periods, list) and len(metadata_periods) > 0:
+                                if isinstance(metadata_periods[0], dict):
+                                    expected_keys = set(
+                                        p.get("iso_date") for p in metadata_periods
+                                        if isinstance(p, dict) and p.get("iso_date")
+                                    )
+                                else:
+                                    expected_keys = set(metadata_periods)
+
+                                # Validate that all actual keys are ISO dates (YYYY-MM-DD format)
+                                for key in actual_keys:
+                                    if not iso_date_pattern.match(key):
+                                        errors.append(
+                                            f"{item_ref}: Period key '{key}' is not in ISO date format (YYYY-MM-DD)"
+                                        )
+
+                                if expected_keys != actual_keys:
+                                    warnings.append(
+                                        f"{item_ref}: Period keys {actual_keys} don't match metadata.periods iso_date values {expected_keys}"
+                                    )
 
         # Validate all line item sections dynamically (no hardcoded field names)
         for array_name in top_level_arrays:
@@ -595,65 +896,149 @@ class ExtractionValidator:
                 - confidence: Confidence score (0-100)
                 - validation_output: Raw LLM validation response
         """
+        def _collect_notes(statement_data: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+            notes = statement_data.get("extraction_notes", []) if isinstance(statement_data, dict) else []
+            if not isinstance(notes, list):
+                return [], []
+            ambiguous_keywords = ["ambiguous", "unclear", "uncertain", "assumption", "assumed", "confidence", "estimate"]
+            ambiguous_notes = [
+                note for note in notes
+                if isinstance(note, str) and any(k in note.lower() for k in ambiguous_keywords)
+            ]
+            return notes, ambiguous_notes
+
         # Detect if multi-statement format
         if self._is_multi_statement_format(data):
             if verbose:
-                console.print(f"[blue]Validating multi-statement section structure against PDF...[/blue]")
+                console.print(f"[blue]Validating multi-statement section structure against PDF (single request)...[/blue]")
 
-            # Validate each statement separately
-            overall_valid = True
-            all_errors = []
-            all_warnings = []
-            all_validation_outputs = []
-
+            # Build combined summary for all statements
+            statement_summaries = []
             for statement_key, statement_data in data.items():
-                if verbose:
-                    console.print(f"\n[dim]Validating {statement_key.replace('_', ' ')}...[/dim]")
+                if not isinstance(statement_data, dict):
+                    continue
 
-                result = self._validate_single_statement_structure(
-                    file_id,
-                    statement_data,
-                    statement_key.replace('_', ' '),
-                    verbose=False
+                extracted_sections = [
+                    k for k in statement_data.keys()
+                    if k not in ["metadata", "extraction_notes"] and isinstance(statement_data[k], list)
+                ]
+
+                section_summary = f"Statement '{statement_key}': {len(extracted_sections)} sections\n"
+                for i, section_name in enumerate(extracted_sections, 1):
+                    section_data = statement_data[section_name]
+                    line_count = len(section_data)
+                    first_label = section_data[0].get("label", "Unknown") if section_data else "Empty"
+                    last_label = section_data[-1].get("label", "Unknown") if section_data else "Empty"
+                    section_summary += f"  {i}. {section_name} ({line_count} line items)\n"
+                    section_summary += f"     - First item: {first_label}\n"
+                    section_summary += f"     - Last item: {last_label}\n"
+
+                notes, ambiguous_notes = _collect_notes(statement_data)
+                if notes:
+                    section_summary += "  Extraction notes:\n"
+                    for note in notes[:6]:
+                        section_summary += f"  - {note}\n"
+                if ambiguous_notes:
+                    section_summary += "  Ambiguities (focus here):\n"
+                    for note in ambiguous_notes[:6]:
+                        section_summary += f"  - {note}\n"
+
+                statement_summaries.append(section_summary)
+
+            validation_prompt = f"""You are validating multi-statement extraction structure against the source PDF.
+
+TASK: Validate ALL extracted statements together against the PDF.
+FOCUS: Prioritize sections or areas mentioned in extraction_notes, especially ambiguities.
+Also verify overall section count, names, boundaries, and missing/extra sections.
+
+STRICT COMPLETENESS RULE:
+- If ANY statement has missing sections/rows/columns (missing != NONE) OR any YES/NO check is NO, then OVERALL MUST BE INVALID.
+- Do NOT mark OVERALL as VALID if you list anything missing.
+- Additionally, if the PDF contains a primary statement that is NOT PRESENT in the extracted JSON at all, OVERALL MUST BE INVALID.
+
+EXTRACTED STRUCTURE:
+{chr(10).join(statement_summaries)}
+
+RESPOND IN THIS FORMAT:
+
+OVERALL: [VALID/INVALID] - [Overall assessment]
+MISSING_STATEMENTS: [NONE|LIST] - [If LIST, name the missing statement headings]
+STATEMENTS:
+1. <statement_key>: Section count [YES/NO], names [YES/NO], boundaries [YES/NO], missing [NONE/LIST], extra [NONE/LIST]
+... (one line per statement)
+
+If INVALID, list specific corrections needed.
+"""
+
+            try:
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_id": file_id},
+                            {"type": "input_text", "text": validation_prompt}
+                        ]
+                    }]
                 )
 
-                if not result['is_valid']:
-                    overall_valid = False
-                    all_errors.extend([f"{statement_key}: {e}" for e in result['errors']])
+                validation_output = response.output_text if hasattr(response, 'output_text') else str(response)
 
-                all_warnings.extend([f"{statement_key}: {w}" for w in result['warnings']])
-                all_validation_outputs.append(f"\n{statement_key}:\n{result.get('validation_output', 'No output')}")
+                is_valid = ("OVERALL: VALID" in validation_output or "OVERALL: [VALID]" in validation_output)
+                # If the model lists missing content, treat as invalid even if it mistakenly says OVERALL: VALID.
+                if "missing LIST" in validation_output or "FOUND MISSING" in validation_output:
+                    is_valid = False
+                if "MISSING_STATEMENTS:" in validation_output and "MISSING_STATEMENTS: NONE" not in validation_output:
+                    is_valid = False
+                errors = []
+                warnings = []
 
-            # Calculate combined confidence
-            confidence = 100 if overall_valid else max(0, 100 - (len(all_errors) * 15) - (len(all_warnings) * 5))
+                if not is_valid:
+                    if "OVERALL: INVALID" in validation_output:
+                        parts = validation_output.split("OVERALL: INVALID")
+                        if len(parts) > 1:
+                            reason = parts[1].strip().split('\n')[0]
+                            errors.append(f"Structure validation failed: {reason}")
+                    if "missing" in validation_output.lower():
+                        warnings.append("Some sections may be missing from extraction")
+                    if "extra" in validation_output.lower():
+                        errors.append("Extra sections created that shouldn't exist")
+                    if "MISSING_STATEMENTS:" in validation_output and "MISSING_STATEMENTS: NONE" not in validation_output:
+                        errors.append("One or more statements appear in the PDF but were not extracted at all")
 
-            # Display combined results
-            if verbose:
-                if overall_valid:
-                    console.print(f"\n[green]✓ Multi-statement section structure validation passed (confidence: {confidence}%)[/green]")
-                else:
-                    console.print(f"\n[red]✗ Multi-statement section structure validation failed (confidence: {confidence}%)[/red]")
-                    if all_errors:
-                        console.print(f"[red]Errors ({len(all_errors)}):[/red]")
-                        for error in all_errors:
-                            console.print(f"  [red]• {error}[/red]")
-                    if all_warnings:
-                        console.print(f"[yellow]Warnings ({len(all_warnings)}):[/yellow]")
-                        for warning in all_warnings:
-                            console.print(f"  [yellow]• {warning}[/yellow]")
+                confidence = 100 if is_valid else max(0, 100 - (len(errors) * 15) - (len(warnings) * 5))
 
-                # Show detailed outputs
-                console.print(f"\n[dim]Detailed validation responses:[/dim]")
-                for output in all_validation_outputs:
-                    console.print(f"[dim]{output}[/dim]")
+                if verbose:
+                    if is_valid:
+                        console.print(f"\n[green]✓ Multi-statement section structure validation passed (confidence: {confidence}%)[/green]")
+                    else:
+                        console.print(f"\n[red]✗ Multi-statement section structure validation failed (confidence: {confidence}%)[/red]")
+                        if errors:
+                            console.print(f"[red]Errors ({len(errors)}):[/red]")
+                            for error in errors:
+                                console.print(f"  [red]• {error}[/red]")
+                        if warnings:
+                            console.print(f"[yellow]Warnings ({len(warnings)}):[/yellow]")
+                            for warning in warnings:
+                                console.print(f"  [yellow]• {warning}[/yellow]")
+                    console.print(f"\n[dim]Detailed validation response:[/dim]\n[dim]{validation_output}[/dim]")
 
-            return {
-                'is_valid': overall_valid,
-                'errors': all_errors,
-                'warnings': all_warnings,
-                'confidence': confidence,
-                'validation_output': '\n'.join(all_validation_outputs)
-            }
+                return {
+                    'is_valid': is_valid,
+                    'errors': errors,
+                    'warnings': warnings,
+                    'confidence': confidence,
+                    'validation_output': validation_output
+                }
+            except Exception as e:
+                console.print(f"[red]✗ Validation failed: {str(e)}[/red]")
+                return {
+                    "is_valid": False,
+                    "confidence": 0,
+                    "errors": [f"Validation error: {str(e)}"],
+                    "warnings": [],
+                    "validation_output": None
+                }
         else:
             # Single statement validation
             return self._validate_single_statement_structure(

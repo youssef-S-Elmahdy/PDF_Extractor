@@ -105,7 +105,6 @@ Extract data from a single PDF file.
   - Available formats: `json`, `txt`, `csv`, `md`
 - `--validate, -v`: Validate extracted data (flag)
 - `--model, -m`: Model to use (default: `gpt-5-mini`)
-  - Options: `gpt-4`, `gpt-5-mini`
 - `--api-key`: OpenAI API key (or set `OPENAI_API_KEY` env var)
 - `--preview/--no-preview`: Show/hide preview of extracted data (default: show)
 

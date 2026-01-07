@@ -4,6 +4,7 @@ PDF Extractor - CLI application for extracting data from PDFs using OpenAI's API
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Optional, List
 import typer
@@ -29,6 +30,111 @@ app = typer.Typer(
 )
 
 console = Console()
+
+def _to_snake_case(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[’']", "", text)
+    text = re.sub(r"[^a-z0-9]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or "statement"
+
+def _parse_missing_statements(validation_output: str) -> List[str]:
+    if not validation_output:
+        return []
+    lines = validation_output.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("MISSING_STATEMENTS:"):
+            rest = line.split(":", 1)[1].strip()
+            if rest.startswith("NONE") or rest.startswith("[NONE"):
+                return []
+            # Expected: "LIST - heading1, heading2" possibly continuing until "STATEMENTS:"
+            collected = [rest]
+            for j in range(i + 1, len(lines)):
+                nxt = lines[j].strip()
+                if not nxt:
+                    break
+                if nxt.startswith("STATEMENTS:") or nxt.startswith("OVERALL:"):
+                    break
+                collected.append(nxt)
+            blob = " ".join(collected).strip()
+            blob = re.sub(r"^\[?LIST\]?\s*-\s*", "", blob, flags=re.IGNORECASE)
+            blob = re.sub(r"^LIST\s*-\s*", "", blob, flags=re.IGNORECASE)
+            parts = re.split(r"\s*[,;]\s*|\s+\|\s+", blob)
+            headings = [p.strip(" -\t") for p in parts if p.strip(" -\t")]
+            return headings
+    return []
+
+def _parse_incomplete_statement_keys(validation_output: str) -> List[str]:
+    """
+    Extract statement keys that the structure validator flags as incomplete.
+
+    We look for an "If INVALID" / "specific corrections needed" section and parse
+    bullet lines like: "- changes_in_shareholders_equity — ..."
+    """
+    if not validation_output:
+        return []
+    keys: List[str] = []
+    in_corrections = False
+    for raw in validation_output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.lower().startswith("if invalid"):
+            in_corrections = True
+            continue
+        if line.startswith("MISSING_STATEMENTS:"):
+            # Not the section we need; keep scanning
+            continue
+        if in_corrections:
+            m = re.match(r"^-\s+([a-z0-9_]+)\s*[—:-]\s*", line)
+            if m:
+                keys.append(m.group(1))
+    # De-duplicate while preserving order
+    seen = set()
+    out: List[str] = []
+    for k in keys:
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out
+
+def _parse_required_rows_for_statement(validation_output: str, statement_key: str, max_rows: int = 30) -> List[str]:
+    """
+    Pull a short list of row labels that must be present as separate lines for a given statement.
+    This is best-effort parsing of the bullet list under the statement's correction block.
+    """
+    if not validation_output or not statement_key:
+        return []
+
+    lines = validation_output.splitlines()
+    start_idx = None
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if re.match(rf"^-\s+{re.escape(statement_key)}\s*[—:-]\s*", line):
+            start_idx = i
+            break
+    if start_idx is None:
+        return []
+
+    required: List[str] = []
+    for j in range(start_idx + 1, len(lines)):
+        line = lines[j].rstrip()
+        if not line.strip():
+            continue
+        if line.strip().startswith("- "):
+            break
+        m = re.match(r"^\s*-\s+(.+)$", line)
+        if not m:
+            continue
+        label = m.group(1).strip()
+        # Skip meta bullets
+        if label.lower().startswith("missing"):
+            continue
+        required.append(label)
+        if len(required) >= max_rows:
+            break
+    return required
 
 
 @app.command()
@@ -121,19 +227,52 @@ def extract(
 
         extracted_data = result["output_text"]
 
+        # Normalize common JSON drift (financial template) before any further steps
+        if template == "financial":
+            try:
+                import json
+                parsed_data = json.loads(extracted_data)
+                validator = ExtractionValidator(api_key=api_key, model=model)
+                normalized_data, fixes = validator.normalize_financial_json(parsed_data)
+                if fixes:
+                    extracted_data = json.dumps(normalized_data, indent=2)
+                    console.print(f"[dim]Normalized extracted JSON ({len(fixes)} fixes)[/dim]")
+            except json.JSONDecodeError:
+                pass
+
         # Show extraction notes if available
         console.print(f"\n[bold]Step 3b: Extraction Notes (QA Review)[/bold]")
         try:
             import json
             parsed_data = json.loads(extracted_data)
-            if "extraction_notes" in parsed_data and parsed_data["extraction_notes"]:
+            notes_printed = False
+
+            # Single-statement format
+            if isinstance(parsed_data, dict) and parsed_data.get("extraction_notes"):
                 console.print("─" * 80)
                 console.print("[bold cyan]EXTRACTION NOTES:[/bold cyan]")
                 console.print("─" * 80)
                 for note in parsed_data["extraction_notes"]:
                     console.print(f"  [cyan]•[/cyan] {note}")
                 console.print("─" * 80)
-            else:
+                notes_printed = True
+
+            # Multi-statement format (statement keys at top-level)
+            if isinstance(parsed_data, dict) and not notes_printed:
+                for statement_key, statement_data in parsed_data.items():
+                    if not isinstance(statement_data, dict):
+                        continue
+                    statement_notes = statement_data.get("extraction_notes")
+                    if not statement_notes:
+                        continue
+                    console.print("─" * 80)
+                    console.print(f"[bold cyan]EXTRACTION NOTES: {statement_key}[/bold cyan]")
+                    console.print("─" * 80)
+                    for note in statement_notes:
+                        console.print(f"  [cyan]•[/cyan] {note}")
+                    notes_printed = True
+
+            if not notes_printed:
                 console.print("[dim]No extraction notes logged by model[/dim]")
         except json.JSONDecodeError:
             console.print("[yellow]Cannot parse extraction notes (invalid JSON)[/yellow]")
@@ -179,6 +318,88 @@ def extract(
 
                 if not structure_validation_result["is_valid"]:
                     console.print("[red]⚠ Section structure validation found issues - see details above[/red]")
+
+                    # Attempt targeted re-extraction of missing statements (only when --validate and template financial)
+                    missing_headings = _parse_missing_statements(structure_validation_result.get("validation_output") or "")
+                    if missing_headings:
+                        console.print(f"\n[yellow]Attempting to re-extract missing statements ({len(missing_headings)})...[/yellow]")
+                        merged = parsed_data
+                        for heading in missing_headings:
+                            statement_key = _to_snake_case(heading)
+                            repair_prompt = prompt_templates.financial_statement_repair_prompt(
+                                statement_heading=heading,
+                                statement_key=statement_key
+                            )
+                            repair_result = extractor.extract(file_id, repair_prompt, enforce_json=True)
+                            if not repair_result.get("success"):
+                                console.print(f"[yellow]⚠ Could not re-extract '{heading}': {repair_result.get('error')}[/yellow]")
+                                continue
+                            try:
+                                repair_json = json.loads(repair_result["output_text"])
+                                if isinstance(repair_json, dict):
+                                    merged.update(repair_json)
+                            except Exception:
+                                console.print(f"[yellow]⚠ Re-extraction returned invalid JSON for '{heading}'[/yellow]")
+
+                        # Normalize again after merge
+                        normalized_data, fixes = validator.normalize_financial_json(merged)
+                        extracted_data = json.dumps(normalized_data, indent=2)
+                        if fixes:
+                            console.print(f"[dim]Normalized merged JSON ({len(fixes)} fixes)[/dim]")
+
+                        # Re-run structure validation once after repairs
+                        console.print(f"\n[bold]Step 4b (re-check): Validating section structure against PDF[/bold]")
+                        structure_validation_result = validator.validate_section_structure(
+                            file_id=file_id,
+                            data=normalized_data,
+                            statement_type=statement_type,
+                            verbose=True
+                        )
+                    # Attempt targeted re-extraction of incomplete statements (missing/aggregated rows)
+                    if not structure_validation_result["is_valid"]:
+                        validation_output = structure_validation_result.get("validation_output") or ""
+                        incomplete_keys = _parse_incomplete_statement_keys(validation_output)
+                        if incomplete_keys:
+                            console.print(f"\n[yellow]Attempting to re-extract incomplete statements ({len(incomplete_keys)})...[/yellow]")
+                            merged = parsed_data
+                            for statement_key in incomplete_keys:
+                                current = merged.get(statement_key) if isinstance(merged, dict) else None
+                                heading = None
+                                if isinstance(current, dict):
+                                    heading = (current.get("metadata") or {}).get("statement_type")
+                                heading = heading or statement_key.replace("_", " ")
+
+                                required_rows = _parse_required_rows_for_statement(validation_output, statement_key)
+                                repair_prompt = prompt_templates.financial_statement_repair_prompt(
+                                    statement_heading=str(heading),
+                                    statement_key=statement_key,
+                                    required_row_labels=required_rows
+                                )
+                                repair_result = extractor.extract(file_id, repair_prompt, enforce_json=True)
+                                if not repair_result.get("success"):
+                                    console.print(f"[yellow]⚠ Could not re-extract '{statement_key}': {repair_result.get('error')}[/yellow]")
+                                    continue
+                                try:
+                                    repair_json = json.loads(repair_result["output_text"])
+                                    if isinstance(repair_json, dict) and statement_key in repair_json:
+                                        merged[statement_key] = repair_json[statement_key]
+                                except Exception:
+                                    console.print(f"[yellow]⚠ Re-extraction returned invalid JSON for '{statement_key}'[/yellow]")
+
+                            # Normalize again after merge
+                            normalized_data, fixes = validator.normalize_financial_json(merged)
+                            extracted_data = json.dumps(normalized_data, indent=2)
+                            if fixes:
+                                console.print(f"[dim]Normalized merged JSON ({len(fixes)} fixes)[/dim]")
+
+                            # Re-run structure validation once after repairs
+                            console.print(f"\n[bold]Step 4b (re-check): Validating section structure against PDF[/bold]")
+                            structure_validation_result = validator.validate_section_structure(
+                                file_id=file_id,
+                                data=normalized_data,
+                                statement_type=statement_type,
+                                verbose=True
+                            )
             except json.JSONDecodeError:
                 console.print("[red]Cannot validate section structure - data is not valid JSON[/red]")
 
@@ -195,24 +416,31 @@ def extract(
             # Apply corrections if validation found issues
             if not validation_result["is_valid"] and validation_result.get("validation_output"):
                 console.print("\n[yellow]Attempting to apply corrections from validation...[/yellow]")
-                corrected_result, corrections = validator.apply_corrections_from_validation(
-                    data=result,
-                    validation_output=validation_result["validation_output"],
-                    verbose=True
-                )
+                try:
+                    import json
+                    data_for_correction = json.loads(extracted_data)
+                except Exception:
+                    data_for_correction = None
+
+                if isinstance(data_for_correction, dict):
+                    corrected_data, corrections = validator.apply_corrections_from_validation(
+                        data=data_for_correction,
+                        validation_output=validation_result["validation_output"],
+                        verbose=True
+                    )
+                else:
+                    corrected_data, corrections = (None, [])
 
                 if corrections:
-                    # Update result with corrected data
-                    result = corrected_result
+                    # Update extracted_data with corrected JSON for saving and any subsequent steps
                     console.print(f"[green]✓ Applied {len(corrections)} corrections[/green]")
 
                     # Re-run validation to confirm corrections
                     console.print("\n[dim]Re-validating after corrections...[/dim]")
-                    import json
                     revalidation_result = validator.validate(
                         file_id=file_id,
                         data_type=statement_type if template == "financial" else "data",
-                        extracted_data=json.dumps(result, indent=2)
+                        extracted_data=json.dumps(corrected_data, indent=2)
                     )
 
                     # Display updated validation results
@@ -221,8 +449,7 @@ def extract(
                     else:
                         console.print(f"[yellow]⚠ Some issues remain (confidence: {revalidation_result.get('confidence', 'N/A')}%)[/yellow]")
 
-                    # Update extracted_data with corrected result for saving
-                    extracted_data = json.dumps(result, indent=2)
+                    extracted_data = json.dumps(corrected_data, indent=2)
                 else:
                     console.print("[yellow]⚠ No corrections could be automatically applied[/yellow]")
 

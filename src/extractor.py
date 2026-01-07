@@ -26,7 +26,7 @@ class ExtractionEngine:
 
         Args:
             api_key: OpenAI API key (if None, will use OPENAI_API_KEY env var)
-            model: Model to use for extraction (5.2, gpt-5-mini)
+            model: Model to use for extraction (default: gpt-5-mini)
             max_retries: Maximum number of retry attempts for failed requests
             retry_delay: Base delay in seconds between retries (uses exponential backoff)
         """
