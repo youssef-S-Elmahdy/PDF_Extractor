@@ -2,7 +2,7 @@
 Prompt templates for PDF extraction and validation
 """
 
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 class PromptTemplates:
@@ -459,4 +459,147 @@ class PromptTemplates:
         prompt += "- Maintain structure and hierarchy\n"
         prompt += "- Note any ambiguities or unclear sections"
 
+        return prompt
+
+    @staticmethod
+    def notes_extraction_prompt(note_ids: List[str]) -> str:
+        """
+        Generate prompt for extracting specific notes from financial statements.
+
+        Args:
+            note_ids: List of note identifiers to extract (e.g., ["3.1", "7.1", "7.2"])
+
+        Returns:
+            Formatted notes extraction prompt
+        """
+        note_list = ", ".join(note_ids)
+
+        prompt = "You are a financial notes extraction API. You MUST return ONLY valid JSON.\n"
+        prompt += "DO NOT include any explanatory text, commentary, notes, or markdown formatting.\n"
+        prompt += "DO NOT wrap the JSON in code blocks (no ```json).\n"
+        prompt += "Return raw JSON only.\n\n"
+
+        prompt += f"TASK: Extract ONLY these notes from the financial document: {note_list}\n"
+        prompt += "IMPORTANT: Extract ONLY TABLES under each requested note. Skip all narrative paragraphs.\n"
+        prompt += "If a note contains multiple tables (e.g., Table 8.3.A, 8.3.B, 8.3.C), you MUST extract ALL of them.\n"
+        prompt += "NEVER return an empty tables array if the note contains tables.\n"
+        prompt += "NEVER say you are skipping/deferring/omitting tables due to constraints.\n\n"
+
+        prompt += "OUTPUT STRUCTURE - CRITICAL:\n"
+        prompt += "- Each note MUST be a TOP-LEVEL KEY: note_<note_id> with dots → underscores (e.g., note_8_3).\n"
+        prompt += "- Each note MUST contain metadata, extraction_notes, and a tables array.\n"
+        prompt += "- Each item in tables MUST represent exactly ONE printed table (do not merge tables).\n\n"
+
+        prompt += "{\n"
+        prompt += '  "note_8_3": {\n'
+        prompt += '    "metadata": {\n'
+        prompt += '      "statement_type": "note",\n'
+        prompt += '      "note_id": "8.3",\n'
+        prompt += '      "note_title": "Exact note heading from PDF",\n'
+        prompt += '      "company_name": "...",\n'
+        prompt += '      "reporting_date": "YYYY-MM-DD",\n'
+        prompt += '      "currency": "Auto-detected",\n'
+        prompt += '      "original_units": "Auto-detected",\n'
+        prompt += '      "units_multiplier": 1000000,\n'
+        prompt += '      "dates_covered": "YYYY-MM-DD to YYYY-MM-DD or YYYY-MM-DD, YYYY-MM-DD",\n'
+        prompt += '      "periods": []\n'
+        prompt += '    },\n'
+        prompt += '    "extraction_notes": ["Kept short; list detected tables and any ambiguities"],\n'
+        prompt += '    "tables": [\n'
+        prompt += '      {\n'
+        prompt += '        "table_id": "Table 8.3.A",\n'
+        prompt += '        "table_title": "Exact table caption/heading near the table (if present)",\n'
+        prompt += '        "table_description": "One short sentence describing what the table represents.",\n'
+        prompt += '        "table_type": "time_series or matrix",\n'
+        prompt += '        "metadata": {\n'
+        prompt += '          "currency": "Auto-detected or null if not applicable",\n'
+        prompt += '          "original_units": "Auto-detected (EUR m / Number of shares / % / etc.)",\n'
+        prompt += '          "units_multiplier": 1000000,\n'
+        prompt += '          "dates_covered": "YYYY-MM-DD to YYYY-MM-DD or YYYY-MM-DD, YYYY-MM-DD",\n'
+        prompt += '          "periods": [{"label":"Exact column header","iso_date":"YYYY-MM-DD","context":"optional"}],\n'
+        prompt += '          "columns": [{"key":"snake_case","label":"Exact leaf column header text","value_type":"number|text|date|percent"}]\n'
+        prompt += '        },\n'
+        prompt += '        "lines": [\n'
+        prompt += '          {"line_number": 1, "label": "Exact row label", "level": 0, "is_total": false, "notes_reference": [], "values": {"YYYY-MM-DD": 123}}\n'
+        prompt += '        ]\n'
+        prompt += '      }\n'
+        prompt += '    ]\n'
+        prompt += '  }\n'
+        prompt += "}\n\n"
+
+        prompt += "HARD RULES (NON-NEGOTIABLE):\n"
+        prompt += "- TABLES ONLY. Do NOT include narrative text sections; do NOT output explanatory_text.\n"
+        prompt += "- Do NOT summarize tables. Extract ALL rows and ALL numeric columns.\n"
+        prompt += "- Do NOT output only totals/aggregates. Every printed row must be a line item.\n"
+        prompt += "- Do NOT merge multiple distinct tables into one.\n"
+        prompt += "- Do NOT collapse multiple printed rows into one row.\n"
+        prompt += "- Table identification: table_id must match the printed label exactly (e.g., 'Table 8.3.A').\n"
+        prompt += "- If you detect a printed table label (e.g., 'Table 3.1.H'), you MUST include a corresponding table object with non-empty lines.\n"
+        prompt += "- Note metadata.periods MUST be [] (notes store axes per table only).\n"
+        prompt += "- If a table shows comparative columns (e.g., 31.12.2024 and 31.12.2023), you MUST include BOTH (never drop a year/date block).\n"
+        prompt += "- Apply the SAME numeric cleaning rules as statements:\n"
+        prompt += "  * Missing values (blank, '-', '—', 'n/a') => null\n"
+        prompt += "  * Never invent 0; only use 0 if the PDF explicitly shows 0\n"
+        prompt += "  * Parentheses => negative numbers\n"
+        prompt += "  * Apply units_multiplier ONLY to monetary amounts; do NOT multiply counts/percentages/ratios\n"
+        prompt += "- Axis decision per table (choose EXACTLY ONE):\n"
+        prompt += "  * time_series: metadata.periods (non-empty), metadata.columns = [], and values keys = iso_date\n"
+        prompt += "  * matrix: metadata.columns (non-empty), metadata.periods = [], and values keys = metadata.columns[*].key\n"
+        prompt += "- Multi-level / grouped headers (e.g., date groups with sub-columns) MUST be matrix tables:\n"
+        prompt += "  * Flatten to LEAF columns; each leaf column becomes one metadata.columns entry.\n"
+        prompt += "  * labels should include full header path (e.g., '31.12.2024 | Level 1').\n"
+        prompt += "  * keys must be snake_case and MUST NOT be raw ISO dates (prefix if needed).\n"
+        prompt += "- Text or mixed tables: set column value_type accordingly:\n"
+        prompt += "  * number => int/float/null\n"
+        prompt += "  * percent => numeric percent (e.g., '5%' => 5.0), not a string\n"
+        prompt += "  * date => ISO date string 'YYYY-MM-DD' if present, otherwise keep as text\n"
+        prompt += "  * text => string\n"
+        prompt += "- Always keep table_description to 1 short sentence.\n\n"
+
+        prompt += "NOTES LOCATION:\n"
+        prompt += "- Notes usually appear after primary statements.\n"
+        prompt += "- Each note starts with an identifier (e.g., 'NOTE 7.1', 'Note 7.1:').\n"
+        prompt += "- Extract ALL tables until the next note heading begins.\n\n"
+
+        prompt += f"Extract ONLY notes: {note_list}\n"
+        prompt += "If a requested note is not found, omit it from output.\n"
+
+        # Keep notes prompt lean: the table-level metadata rules above are the source of truth.
+
+        return prompt
+
+    @staticmethod
+    def notes_tables_repair_prompt(note_to_table_ids: Dict[str, List[str]]) -> str:
+        """
+        Generate a prompt to re-extract ONLY specific table(s) within one or more notes.
+
+        Args:
+            note_to_table_ids: Mapping like {"3.4": ["Table 3.4.A"], "8.3": ["Table 8.3.B", "Table 8.3.C"]}
+        """
+        # Keep stable ordering for determinism
+        note_ids = sorted(note_to_table_ids.keys(), key=lambda x: [int(p) for p in x.split(".") if p.isdigit()])
+
+        prompt = "You are a financial notes extraction API. You MUST return ONLY valid JSON.\n"
+        prompt += "DO NOT include any explanatory text, commentary, notes, or markdown formatting.\n"
+        prompt += "DO NOT wrap the JSON in code blocks (no ```json).\n"
+        prompt += "Return raw JSON only.\n\n"
+
+        prompt += "TASK: Re-extract ONLY the specified tables under the specified notes.\n"
+        prompt += "IMPORTANT: TABLES ONLY. Skip all narrative paragraphs.\n\n"
+
+        prompt += "NOTES + TABLES TO EXTRACT:\n"
+        for nid in note_ids:
+            tables = note_to_table_ids.get(nid) or []
+            if not tables:
+                continue
+            prompt += f"- Note {nid}: " + ", ".join(tables) + "\n"
+
+        prompt += "\nOUTPUT RULES:\n"
+        prompt += "- Output MUST include ONLY these notes as top-level keys (note_<id> with dots→underscores).\n"
+        prompt += "- For each note, include metadata, extraction_notes, and tables[].\n"
+        prompt += "- For each requested table_id, include exactly ONE table object with COMPLETE rows/columns.\n"
+        prompt += "- Do NOT include non-requested tables.\n"
+        prompt += "- Apply the SAME axis + null/0 + multiplier rules as notes_extraction_prompt.\n\n"
+
+        prompt += "Return JSON only.\n"
         return prompt

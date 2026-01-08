@@ -326,8 +326,21 @@ class ExtractionValidator:
                 if verbose:
                     console.print(f"\n[dim]Validating {statement_key}...[/dim]")
 
-                # Validate each statement separately
-                result = self._validate_single_statement(statement_data, verbose=False)
+                # Check if this is a note by looking at metadata.statement_type
+                is_note = False
+                if isinstance(statement_data, dict) and "metadata" in statement_data:
+                    metadata = statement_data["metadata"]
+                    if isinstance(metadata, dict):
+                        statement_type = metadata.get("statement_type", "")
+                        is_note = statement_type == "note"
+                # Heuristics: notes are keyed note_* and/or contain a tables array
+                if isinstance(statement_key, str) and statement_key.startswith("note_"):
+                    is_note = True
+                if isinstance(statement_data, dict) and isinstance(statement_data.get("tables"), list):
+                    is_note = True
+
+                # Validate each statement or note separately
+                result = self._validate_single_statement(statement_data, verbose=False, is_note=is_note)
 
                 if not result['is_valid']:
                     overall_valid = False
@@ -363,8 +376,15 @@ class ExtractionValidator:
                 'confidence': confidence
             }
         else:
-            # Single statement validation (use existing logic)
-            return self._validate_single_statement(data, verbose)
+            # Single object validation (statement or note)
+            is_note = False
+            if isinstance(data, dict):
+                md = data.get("metadata")
+                if isinstance(md, dict) and md.get("statement_type") == "note":
+                    is_note = True
+                if isinstance(data.get("tables"), list):
+                    is_note = True
+            return self._validate_single_statement(data, verbose, is_note=is_note)
 
     def normalize_financial_json(
         self,
@@ -398,7 +418,7 @@ class ExtractionValidator:
 
             # If any line-item values keys are not ISO dates, treat this statement as a matrix table.
             for array_name, value in statement_data.items():
-                if array_name in ["metadata", "extraction_notes"]:
+                if array_name in ["metadata", "extraction_notes", "explanatory_text"]:
                     continue
                 if not isinstance(value, list):
                     continue
@@ -408,6 +428,19 @@ class ExtractionValidator:
                     values_obj = item.get("values")
                     if isinstance(values_obj, dict) and values_obj:
                         return not _keys_look_like_iso_dates(values_obj)
+            return False
+
+        def _is_note_object(obj: Any, key_hint: str = "") -> bool:
+            if not isinstance(obj, dict):
+                return False
+            if isinstance(key_hint, str) and key_hint.startswith("note_"):
+                return True
+            md = obj.get("metadata")
+            if isinstance(md, dict) and md.get("statement_type") == "note":
+                return True
+            # Heuristic: notes are expected to have a tables array
+            if "tables" in obj and isinstance(obj.get("tables"), list):
+                return True
             return False
 
         def normalize_statement(statement_data: Dict[str, Any], statement_key: str) -> Dict[str, Any]:
@@ -551,6 +584,22 @@ class ExtractionValidator:
                 if "notes_reference" not in item or not isinstance(item.get("notes_reference"), list):
                     item["notes_reference"] = []
                     fixes.append(f"{statement_key}: set missing notes_reference for {array_name}[{idx}]")
+                else:
+                    # Coerce note references to strings (models sometimes emit numbers)
+                    coerced: List[str] = []
+                    changed = False
+                    for n in item.get("notes_reference", []):
+                        if isinstance(n, str):
+                            coerced.append(n)
+                            continue
+                        if n is None:
+                            changed = True
+                            continue
+                        coerced.append(str(n))
+                        changed = True
+                    if changed:
+                        item["notes_reference"] = coerced
+                        fixes.append(f"{statement_key}: coerced notes_reference entries to strings for {array_name}[{idx}]")
 
                 # Normalize row_as_of type (must be ISO date string or null)
                 if "row_as_of" in item and isinstance(item.get("row_as_of"), dict):
@@ -592,7 +641,7 @@ class ExtractionValidator:
 
             # Normalize all arrays of line items (any list of dicts with a values object)
             for array_name, value in list(statement_data.items()):
-                if array_name in ["metadata", "extraction_notes"]:
+                if array_name in ["metadata", "extraction_notes", "explanatory_text"]:
                     continue
                 if not isinstance(value, list) or len(value) == 0:
                     continue
@@ -607,27 +656,308 @@ class ExtractionValidator:
 
             return statement_data
 
+        def normalize_note(note_data: Dict[str, Any], note_key: str) -> Dict[str, Any]:
+            """
+            Notes are NOT statements. They contain a tables[] array where each table has its own
+            metadata + line items. We must avoid treating the tables array as a line-item array.
+            """
+            if not isinstance(note_data, dict):
+                return note_data
+
+            metadata = note_data.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                note_data["metadata"] = metadata
+                fixes.append(f"{note_key}: added missing metadata object")
+
+            if metadata.get("statement_type") != "note":
+                metadata["statement_type"] = "note"
+                fixes.append(f"{note_key}: set metadata.statement_type='note'")
+
+            # Notes store axes per table; keep note-level periods empty to avoid axis ambiguity.
+            if not isinstance(metadata.get("periods"), list) or len(metadata.get("periods") or []) > 0:
+                metadata["periods"] = []
+                fixes.append(f"{note_key}: set metadata.periods=[] (notes store axes per table)")
+            if "columns" in metadata:
+                metadata.pop("columns", None)
+                fixes.append(f"{note_key}: removed metadata.columns from note (axes are per table)")
+
+            # Notes must not expose top-level columns; tables own their own axes.
+            if "columns" in note_data:
+                note_data.pop("columns", None)
+                fixes.append(f"{note_key}: removed forbidden top-level columns (notes use tables[].metadata)")
+            if "metadata_columns" in note_data:
+                note_data.pop("metadata_columns", None)
+                fixes.append(f"{note_key}: removed forbidden metadata_columns (notes use tables[].metadata)")
+
+            tables = note_data.get("tables")
+            if isinstance(tables, list):
+                normalized_tables: List[Any] = []
+                for i, table in enumerate(tables):
+                    if not isinstance(table, dict):
+                        normalized_tables.append(table)
+                        continue
+                    table_key = f"{note_key}.tables[{i}]"
+                    table = normalize_statement(table, table_key)
+
+                    # Notes tables may drift: move any top-level 'columns' into table.metadata.columns
+                    if isinstance(table, dict):
+                        table_md = table.get("metadata")
+                        if not isinstance(table_md, dict):
+                            table_md = {}
+                            table["metadata"] = table_md
+                            fixes.append(f"{table_key}: added missing metadata object")
+
+                        if "columns" in table and isinstance(table.get("columns"), list) and not isinstance(table_md.get("columns"), list):
+                            table_md["columns"] = table.pop("columns")
+                            fixes.append(f"{table_key}: moved top-level columns -> metadata.columns")
+
+                        # Normalize column objects: allow {header,key} drift and infer value_type
+                        cols = table_md.get("columns")
+                        if isinstance(cols, list) and cols:
+                            # First pass: normalize header/label fields and ensure strings
+                            for c_idx, col in enumerate(cols):
+                                if not isinstance(col, dict):
+                                    continue
+                                if "label" not in col and isinstance(col.get("header"), str) and col.get("header").strip():
+                                    col["label"] = col.get("header").strip()
+                                    fixes.append(f"{table_key}: mapped metadata.columns[{c_idx}].header -> label")
+                                col.pop("header", None)
+                                if "key" in col and not isinstance(col.get("key"), str):
+                                    col["key"] = str(col.get("key"))
+                                    fixes.append(f"{table_key}: coerced metadata.columns[{c_idx}].key to string")
+                                if "label" in col and not isinstance(col.get("label"), str):
+                                    col["label"] = str(col.get("label"))
+                                    fixes.append(f"{table_key}: coerced metadata.columns[{c_idx}].label to string")
+
+                            # Infer missing value_type from observed cell values
+                            observed: Dict[str, str] = {}
+                            lines = table.get("lines")
+                            if isinstance(lines, list):
+                                for line in lines:
+                                    if not isinstance(line, dict):
+                                        continue
+                                    values = line.get("values")
+                                    if not isinstance(values, dict):
+                                        continue
+                                    for k, v in values.items():
+                                        if not isinstance(k, str):
+                                            continue
+                                        if v is None:
+                                            continue
+                                        if isinstance(v, (int, float)):
+                                            observed.setdefault(k, "number")
+                                        elif isinstance(v, str):
+                                            # Percent-like strings -> percent
+                                            if re.match(r"^\s*-?\d+(?:\.\d+)?\s*%\s*$", v):
+                                                observed[k] = "percent"
+                                            else:
+                                                observed[k] = "text"
+                                        else:
+                                            observed[k] = "text"
+
+                            for c_idx, col in enumerate(cols):
+                                if not isinstance(col, dict):
+                                    continue
+                                key = col.get("key")
+                                if not isinstance(key, str) or not key:
+                                    continue
+                                if not isinstance(col.get("value_type"), str) or not col.get("value_type"):
+                                    inferred = observed.get(key)
+                                    if inferred:
+                                        col["value_type"] = inferred
+                                        fixes.append(f"{table_key}: inferred metadata.columns[{c_idx}].value_type='{inferred}'")
+
+                        # Flatten nested dict cells (common drift for multi-level headers)
+                        lines = table.get("lines")
+                        if isinstance(lines, list) and lines:
+                            for l_idx, line in enumerate(lines):
+                                if not isinstance(line, dict):
+                                    continue
+                                values = line.get("values")
+                                if not isinstance(values, dict) or not values:
+                                    continue
+                                if not any(isinstance(v, dict) for v in values.values()):
+                                    continue
+
+                                # Convert to matrix: flatten {period: {subcol: x}} into composite column keys
+                                new_values: Dict[str, Any] = {}
+                                new_cols: List[Dict[str, Any]] = []
+                                existing_cols = table_md.get("columns")
+                                if isinstance(existing_cols, list):
+                                    for c in existing_cols:
+                                        if isinstance(c, dict) and isinstance(c.get("key"), str):
+                                            new_cols.append(c)
+                                existing_keys = {c.get("key") for c in new_cols if isinstance(c, dict)}
+
+                                for outer_key, cell in values.items():
+                                    if isinstance(cell, dict):
+                                        outer_norm = re.sub(r"[^0-9a-zA-Z]+", "_", str(outer_key)).strip("_")
+                                        outer_prefix = f"p{outer_norm}" if outer_norm else "p"
+                                        for inner_key, inner_val in cell.items():
+                                            inner_norm = re.sub(r"[^0-9a-zA-Z]+", "_", str(inner_key)).strip("_").lower()
+                                            composite_key = f"{outer_prefix}_{inner_norm}".lower()
+                                            new_values[composite_key] = inner_val
+                                            if composite_key not in existing_keys:
+                                                new_cols.append({
+                                                    "key": composite_key,
+                                                    "label": f"{outer_key} | {inner_key}",
+                                                    "value_type": "number" if isinstance(inner_val, (int, float)) or inner_val is None else "text",
+                                                })
+                                                existing_keys.add(composite_key)
+                                    else:
+                                        # Keep scalar values as-is (will be validated by axis rules)
+                                        if isinstance(outer_key, str):
+                                            new_values[outer_key] = cell
+                                        else:
+                                            new_values[str(outer_key)] = cell
+
+                                line["values"] = new_values
+                                table_md["columns"] = new_cols
+                                table_md["periods"] = []
+                                table["table_type"] = "matrix"
+                                fixes.append(f"{table_key}: flattened nested dict values into matrix columns (line {l_idx})")
+
+                        # Infer/align axis from actual value keys (unless already forced to matrix above).
+                        iso_date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+                        union_keys: set[str] = set()
+                        if isinstance(lines, list):
+                            for line in lines:
+                                if not isinstance(line, dict):
+                                    continue
+                                vals = line.get("values")
+                                if not isinstance(vals, dict):
+                                    continue
+                                for k in vals.keys():
+                                    if isinstance(k, str):
+                                        union_keys.add(k.strip())
+                                    else:
+                                        union_keys.add(str(k))
+
+                        # If keys are ISO dates, treat as time_series
+                        all_iso = bool(union_keys) and all(isinstance(k, str) and iso_date_pattern.match(k) for k in union_keys)
+                        if all_iso:
+                            table["table_type"] = "time_series"
+                            table_md["columns"] = []
+                            table_md["periods"] = [{"label": k, "iso_date": k, "context": ""} for k in sorted(union_keys)]
+                            fixes.append(f"{table_key}: aligned table_type=time_series from ISO date keys")
+                        else:
+                            # Otherwise, default to matrix if columns exist
+                            if isinstance(table_md.get("columns"), list) and len(table_md["columns"]) > 0:
+                                table["table_type"] = "matrix"
+                                table_md["periods"] = []
+                            elif not isinstance(table.get("table_type"), str) or not table.get("table_type"):
+                                table["table_type"] = "time_series"
+                                fixes.append(f"{table_key}: inferred table_type=time_series (fallback)")
+
+                        # Coerce percent strings for percent-typed columns and apply units_multiplier scaling (best-effort)
+                        units_multiplier = table_md.get("units_multiplier")
+                        if not isinstance(units_multiplier, int):
+                            units_multiplier = metadata.get("units_multiplier") if isinstance(metadata.get("units_multiplier"), int) else None
+
+                        column_types: Dict[str, str] = {}
+                        cols = table_md.get("columns")
+                        if isinstance(cols, list):
+                            for col in cols:
+                                if not isinstance(col, dict):
+                                    continue
+                                k = col.get("key")
+                                vt = col.get("value_type")
+                                if isinstance(k, str) and isinstance(vt, str) and k and vt:
+                                    column_types[k] = vt.lower().strip()
+
+                        def _coerce_scalar(val: Any, vt: Optional[str]) -> Any:
+                            if val is None:
+                                return None
+                            if isinstance(val, str):
+                                s = val.strip()
+                                if s == "" or s.lower() in {"-", "—", "n/a", "na", "null", "none", "not applicable"}:
+                                    return None
+                                # Percent strings -> float percent
+                                if vt in ("percent", "percentage"):
+                                    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*%\s*$", s)
+                                    if m:
+                                        try:
+                                            return float(m.group(1))
+                                        except Exception:
+                                            return None
+                                # Numeric strings -> number for numeric columns
+                                if vt in (None, "number", "numeric"):
+                                    neg = False
+                                    if s.startswith("(") and s.endswith(")"):
+                                        neg = True
+                                        s = s[1:-1].strip()
+                                    s2 = s.replace(",", "").replace(" ", "")
+                                    if re.match(r"^-?\d+(\.\d+)?$", s2):
+                                        try:
+                                            num = float(s2) if "." in s2 else int(s2)
+                                            return -num if neg else num
+                                        except Exception:
+                                            return None
+                                # Otherwise keep as text
+                                return s
+                            return val
+
+                        if isinstance(lines, list):
+                            for line in lines:
+                                if not isinstance(line, dict):
+                                    continue
+                                vals = line.get("values")
+                                if not isinstance(vals, dict):
+                                    continue
+                                new_vals: Dict[str, Any] = {}
+                                for k, v in vals.items():
+                                    key = k.strip() if isinstance(k, str) else str(k)
+                                    vt = column_types.get(key)
+                                    coerced = _coerce_scalar(v, vt)
+
+                                    # Apply units scaling for monetary numeric values when clearly unscaled
+                                    if (
+                                        isinstance(coerced, (int, float))
+                                        and isinstance(units_multiplier, int)
+                                        and units_multiplier > 1
+                                        and (vt is None or vt in ("number", "numeric"))
+                                        and coerced != 0
+                                        and abs(coerced) < units_multiplier
+                                    ):
+                                        coerced = coerced * units_multiplier
+                                    new_vals[key] = coerced
+                                line["values"] = new_vals
+
+                    normalized_tables.append(table)
+                note_data["tables"] = normalized_tables
+
+            return note_data
+
         if self._is_multi_statement_format(normalized):
             for statement_key, statement_data in list(normalized.items()):
                 if isinstance(statement_data, dict) and "metadata" in statement_data:
-                    normalized[statement_key] = normalize_statement(statement_data, statement_key)
+                    if _is_note_object(statement_data, statement_key):
+                        normalized[statement_key] = normalize_note(statement_data, statement_key)
+                    else:
+                        normalized[statement_key] = normalize_statement(statement_data, statement_key)
         else:
-            normalized = normalize_statement(normalized, "root")
+            if _is_note_object(normalized, "root"):
+                normalized = normalize_note(normalized, "root")
+            else:
+                normalized = normalize_statement(normalized, "root")
 
         return normalized, fixes
 
     def _validate_single_statement(
         self,
         data: Dict[str, Any],
-        verbose: bool = True
+        verbose: bool = True,
+        is_note: bool = False
     ) -> Dict[str, Any]:
         """
-        Validate a single statement (extracted from existing validate_financial_json logic).
+        Validate a single statement or note (extracted from existing validate_financial_json logic).
         This is the original validation logic, now reusable for both single and multi-statement modes.
 
         Args:
-            data: Parsed JSON dictionary for a single statement
+            data: Parsed JSON dictionary for a single statement or note
             verbose: Whether to print detailed validation results
+            is_note: If True, applies note-specific validation rules
 
         Returns:
             Dictionary containing validation results
@@ -657,6 +987,17 @@ class ExtractionValidator:
                     errors.append(f"Missing metadata.{field}")
                 elif metadata[field] is None or metadata[field] == "":
                     warnings.append(f"metadata.{field} is empty")
+
+            # Note-specific metadata validation
+            if is_note:
+                # Required fields for notes
+                if "note_id" not in metadata:
+                    errors.append("Missing metadata.note_id (required for notes)")
+                if "note_title" not in metadata:
+                    errors.append("Missing metadata.note_title (required for notes)")
+                # Parent statement is recommended but not required
+                if "parent_statement" not in metadata:
+                    warnings.append("Missing metadata.parent_statement (recommended for notes)")
 
             # Recommended metadata fields
             if "reporting_date" not in metadata:
@@ -723,25 +1064,25 @@ class ExtractionValidator:
         if "columns" in data:
             errors.append("Found top-level 'columns'; columns must be stored in metadata.columns (not as a top-level array)")
 
-        # Get all top-level arrays (excluding metadata and extraction_notes)
-        top_level_arrays = [
-            k for k in data.keys()
-            if k not in ["metadata", "extraction_notes", "sections", "metadata_columns", "columns"] and isinstance(data[k], list)
-        ]
-
-        if len(top_level_arrays) == 0:
-            errors.append("No data arrays found (expected at least one section with line items)")
-        else:
-            # Validate each array found
-            for array_name in top_level_arrays:
-                if not isinstance(data[array_name], list):
-                    errors.append(f"'{array_name}' must be an array, got {type(data[array_name]).__name__}")
-                elif len(data[array_name]) == 0:
-                    warnings.append(f"Array '{array_name}' is empty")
-
         # === LINE ITEM VALIDATION ===
-        def validate_line_items(items: List[Dict], section_name: str):
+        def validate_line_items(items: List[Dict], section_name: str, metadata_obj: Optional[Dict[str, Any]] = None):
             """Helper to validate an array of line items"""
+            metadata_obj = metadata_obj if isinstance(metadata_obj, dict) else {}
+            metadata_columns = metadata_obj.get("columns")
+
+            # Optional typed columns: {key,label,value_type}
+            column_types: Dict[str, str] = {}
+            if isinstance(metadata_columns, list):
+                for col in metadata_columns:
+                    if not isinstance(col, dict):
+                        continue
+                    key = col.get("key")
+                    if not isinstance(key, str) or not key:
+                        continue
+                    vt = col.get("value_type")
+                    if isinstance(vt, str) and vt:
+                        column_types[key] = vt.lower().strip()
+
             for i, item in enumerate(items):
                 item_ref = f"{section_name}[{i}]"
 
@@ -779,64 +1120,207 @@ class ExtractionValidator:
                     if not isinstance(item["values"], dict):
                         errors.append(f"{item_ref}: 'values' must be object with period keys, got {type(item['values']).__name__}")
                     else:
-                        # Validate that all values are numeric (or null)
+                        # Validate values by type (default: numeric)
                         for period, val in item["values"].items():
-                            if val is not None and not isinstance(val, (int, float)):
-                                errors.append(
-                                    f"{item_ref}.values[\"{period}\"]: Value must be number or null, "
-                                    f"got {type(val).__name__}: {val}"
-                                )
+                            vt = None
+                            if isinstance(period, str) and period in column_types:
+                                vt = column_types.get(period)
+
+                            # Default behavior (no explicit type): numeric only
+                            if vt is None:
+                                if val is not None and not isinstance(val, (int, float)):
+                                    errors.append(
+                                        f"{item_ref}.values[\"{period}\"]: Value must be number or null, "
+                                        f"got {type(val).__name__}: {val}"
+                                    )
+                                continue
+
+                            if vt in ("number", "numeric"):
+                                if val is not None and not isinstance(val, (int, float)):
+                                    errors.append(
+                                        f"{item_ref}.values[\"{period}\"]: Value must be number or null, "
+                                        f"got {type(val).__name__}: {val}"
+                                    )
+                            elif vt in ("percent", "percentage"):
+                                if val is not None and not isinstance(val, (int, float)):
+                                    errors.append(
+                                        f"{item_ref}.values[\"{period}\"]: Value must be numeric percent or null, "
+                                        f"got {type(val).__name__}: {val}"
+                                    )
+                            elif vt in ("text", "string", "date"):
+                                if val is not None and not isinstance(val, str):
+                                    errors.append(
+                                        f"{item_ref}.values[\"{period}\"]: Value must be string or null, "
+                                        f"got {type(val).__name__}: {val}"
+                                    )
+                            else:
+                                # Unknown type: allow scalar values only
+                                if val is not None and not isinstance(val, (int, float, str, bool)):
+                                    errors.append(
+                                        f"{item_ref}.values[\"{period}\"]: Value must be scalar or null, "
+                                        f"got {type(val).__name__}: {val}"
+                                    )
 
                         # Check that value keys match the declared axis (periods vs component columns)
-                        if "metadata" in data:
-                            metadata_obj = data.get("metadata", {})
-                            metadata_periods = metadata_obj.get("periods")
-                            metadata_columns = metadata_obj.get("columns")
-                            actual_keys = set(item["values"].keys())
+                        metadata_periods = metadata_obj.get("periods")
+                        metadata_columns = metadata_obj.get("columns")
+                        actual_keys = set(item["values"].keys())
 
-                            iso_date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
-                            all_keys_are_iso_dates = all(iso_date_pattern.match(k) for k in actual_keys)
+                        iso_date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+                        all_keys_are_iso_dates = all(iso_date_pattern.match(k) for k in actual_keys)
 
-                            # Axis B: component/measures as columns (matrix tables)
-                            if isinstance(metadata_columns, list) and len(metadata_columns) > 0 and not all_keys_are_iso_dates:
-                                expected_keys = set(
-                                    c.get("key") for c in metadata_columns
-                                    if isinstance(c, dict) and c.get("key")
+                        # Axis B: component/measures as columns (matrix tables)
+                        if isinstance(metadata_columns, list) and len(metadata_columns) > 0 and not all_keys_are_iso_dates:
+                            expected_keys = set(
+                                c.get("key") for c in metadata_columns
+                                if isinstance(c, dict) and c.get("key")
+                            )
+                            if expected_keys and not actual_keys.issubset(expected_keys):
+                                extra = sorted(actual_keys - expected_keys)
+                                errors.append(
+                                    f"{item_ref}: Value keys contain unknown column keys {extra} (not in metadata.columns)"
                                 )
-                                if expected_keys and not actual_keys.issubset(expected_keys):
-                                    extra = sorted(actual_keys - expected_keys)
+                            if isinstance(metadata_periods, list) and len(metadata_periods) > 0:
+                                warnings.append(f"{item_ref}: Detected matrix-style value keys but metadata.periods is populated; expected metadata.periods to be [] for matrix tables")
+
+                        # Axis A: time periods as columns
+                        elif isinstance(metadata_periods, list) and len(metadata_periods) > 0:
+                            if isinstance(metadata_periods[0], dict):
+                                expected_keys = set(
+                                    p.get("iso_date") for p in metadata_periods
+                                    if isinstance(p, dict) and p.get("iso_date")
+                                )
+                            else:
+                                expected_keys = set(metadata_periods)
+
+                            # Validate that all actual keys are ISO dates (YYYY-MM-DD format)
+                            for key in actual_keys:
+                                if not iso_date_pattern.match(key):
                                     errors.append(
-                                        f"{item_ref}: Value keys contain unknown column keys {extra} (not in metadata.columns)"
+                                        f"{item_ref}: Period key '{key}' is not in ISO date format (YYYY-MM-DD)"
                                     )
-                                if isinstance(metadata_periods, list) and len(metadata_periods) > 0:
-                                    warnings.append(f"{item_ref}: Detected matrix-style value keys but metadata.periods is populated; expected metadata.periods to be [] for matrix tables")
 
-                            # Axis A: time periods as columns
-                            elif isinstance(metadata_periods, list) and len(metadata_periods) > 0:
-                                if isinstance(metadata_periods[0], dict):
-                                    expected_keys = set(
-                                        p.get("iso_date") for p in metadata_periods
-                                        if isinstance(p, dict) and p.get("iso_date")
-                                    )
-                                else:
-                                    expected_keys = set(metadata_periods)
+                            if expected_keys != actual_keys:
+                                warnings.append(
+                                    f"{item_ref}: Period keys {actual_keys} don't match metadata.periods iso_date values {expected_keys}"
+                                )
 
-                                # Validate that all actual keys are ISO dates (YYYY-MM-DD format)
-                                for key in actual_keys:
-                                    if not iso_date_pattern.match(key):
-                                        errors.append(
-                                            f"{item_ref}: Period key '{key}' is not in ISO date format (YYYY-MM-DD)"
-                                        )
+        # Notes have a different structure: data.tables[] where each table has metadata + lines[]
+        if is_note:
+            note_metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+            note_periods = note_metadata.get("periods")
+            note_columns = note_metadata.get("columns")
+            if isinstance(note_periods, list) and len(note_periods) > 0:
+                warnings.append("Note-level metadata.periods is populated; note objects should usually keep periods [] and store axes per table")
+            if isinstance(note_columns, list) and len(note_columns) > 0:
+                warnings.append("Note-level metadata.columns is populated; note objects should store axes per table in tables[].metadata")
 
-                                if expected_keys != actual_keys:
-                                    warnings.append(
-                                        f"{item_ref}: Period keys {actual_keys} don't match metadata.periods iso_date values {expected_keys}"
-                                    )
+            if "explanatory_text" in data and data.get("explanatory_text"):
+                warnings.append("Note contains explanatory_text; notes extraction is configured for tables-only")
+
+            tables = data.get("tables")
+            if not isinstance(tables, list):
+                errors.append("Missing 'tables' array (required for notes)")
+                tables = []
+            elif len(tables) == 0:
+                warnings.append("Note tables array is empty")
+
+            for i, table in enumerate(tables):
+                table_ref = f"tables[{i}]"
+                if not isinstance(table, dict):
+                    errors.append(f"{table_ref}: Table entry must be an object, got {type(table).__name__}")
+                    continue
+
+                if "table_id" not in table or not isinstance(table.get("table_id"), str) or not table.get("table_id").strip():
+                    errors.append(f"{table_ref}: Missing required field 'table_id' (must match printed table label, e.g., 'Table 8.3.A')")
+                if "table_description" not in table or not isinstance(table.get("table_description"), str) or not table.get("table_description").strip():
+                    errors.append(f"{table_ref}: Missing required field 'table_description' (1 short sentence)")
+
+                table_metadata = table.get("metadata")
+                if not isinstance(table_metadata, dict):
+                    errors.append(f"{table_ref}: Missing required field 'metadata' (object)")
+                    table_metadata = {}
+                else:
+                    if "units_multiplier" not in table_metadata:
+                        warnings.append(f"{table_ref}.metadata: Missing units_multiplier (recommended)")
+
+                    # Optional component columns for matrix-style tables inside notes
+                    if "columns" in table_metadata:
+                        if not isinstance(table_metadata["columns"], list):
+                            errors.append(f"{table_ref}.metadata.columns must be an array, got {type(table_metadata['columns']).__name__}")
+                        else:
+                            for c_idx, col in enumerate(table_metadata["columns"]):
+                                if not isinstance(col, dict):
+                                    errors.append(f"{table_ref}.metadata.columns[{c_idx}] must be an object with 'key' and 'label'")
+                                    continue
+                                if "key" not in col or not isinstance(col.get("key"), str) or not col.get("key"):
+                                    errors.append(f"{table_ref}.metadata.columns[{c_idx}].key is required and must be a non-empty string")
+                                if "label" not in col or not isinstance(col.get("label"), str) or not col.get("label"):
+                                    errors.append(f"{table_ref}.metadata.columns[{c_idx}].label is required and must be a non-empty string")
+
+                # Lines: accept 'lines' (preferred) or 'rows' (legacy)
+                table_lines = table.get("lines")
+                if table_lines is None:
+                    table_lines = table.get("rows")
+                if not isinstance(table_lines, list):
+                    errors.append(f"{table_ref}: Missing required field 'lines' (array of line items)")
+                    continue
+                if len(table_lines) == 0:
+                    warnings.append(f"{table_ref}.lines is empty")
+                    continue
+
+                validate_line_items(table_lines, f"{table_ref}.lines", table_metadata)
+
+            # === CALCULATE CONFIDENCE (notes) ===
+            confidence = 100 - (len(errors) * 10) - (len(warnings) * 5)
+            confidence = max(0, min(100, confidence))
+            is_valid = len(errors) == 0
+
+            if verbose:
+                if is_valid:
+                    console.print(f"[green]✓ Schema validation passed (confidence: {confidence}%)[/green]")
+                    if warnings:
+                        console.print(f"[yellow]Warnings ({len(warnings)}):[/yellow]")
+                        for warning in warnings:
+                            console.print(f"  [yellow]• {warning}[/yellow]")
+                else:
+                    console.print(f"[red]✗ Schema validation failed (confidence: {confidence}%)[/red]")
+                    console.print(f"[red]Errors ({len(errors)}):[/red]")
+                    for error in errors:
+                        console.print(f"  [red]• {error}[/red]")
+                    if warnings:
+                        console.print(f"[yellow]Warnings ({len(warnings)}):[/yellow]")
+                        for warning in warnings:
+                            console.print(f"  [yellow]• {warning}[/yellow]")
+
+            return {
+                "is_valid": is_valid,
+                "confidence": confidence,
+                "errors": errors,
+                "warnings": warnings
+            }
+
+        # === STATEMENT STRUCTURE VALIDATION (non-notes) ===
+        # Get all top-level arrays (excluding metadata, extraction_notes, and explanatory_text for notes)
+        top_level_arrays = [
+            k for k in data.keys()
+            if k not in ["metadata", "extraction_notes", "explanatory_text", "sections", "metadata_columns", "columns"] and isinstance(data[k], list)
+        ]
+
+        if len(top_level_arrays) == 0:
+            errors.append("No data arrays found (expected at least one section with line items)")
+        else:
+            # Validate each array found
+            for array_name in top_level_arrays:
+                if not isinstance(data[array_name], list):
+                    errors.append(f"'{array_name}' must be an array, got {type(data[array_name]).__name__}")
+                elif len(data[array_name]) == 0:
+                    warnings.append(f"Array '{array_name}' is empty")
 
         # Validate all line item sections dynamically (no hardcoded field names)
         for array_name in top_level_arrays:
             if isinstance(data[array_name], list):
-                validate_line_items(data[array_name], array_name)
+                validate_line_items(data[array_name], array_name, data.get("metadata") if isinstance(data.get("metadata"), dict) else {})
 
         # === CALCULATE CONFIDENCE ===
         # Each error reduces confidence by 10%, each warning by 5%
@@ -917,10 +1401,16 @@ class ExtractionValidator:
             for statement_key, statement_data in data.items():
                 if not isinstance(statement_data, dict):
                     continue
+                # Skip notes in structure validation (notes are handled separately and are tables-only)
+                md = statement_data.get("metadata")
+                if (isinstance(statement_key, str) and statement_key.startswith("note_")) or (
+                    isinstance(md, dict) and md.get("statement_type") == "note"
+                ):
+                    continue
 
                 extracted_sections = [
                     k for k in statement_data.keys()
-                    if k not in ["metadata", "extraction_notes"] and isinstance(statement_data[k], list)
+                    if k not in ["metadata", "extraction_notes", "explanatory_text"] and isinstance(statement_data[k], list)
                 ]
 
                 section_summary = f"Statement '{statement_key}': {len(extracted_sections)} sections\n"
@@ -1045,6 +1535,152 @@ If INVALID, list specific corrections needed.
                 file_id, data, statement_type, verbose
             )
 
+    def validate_notes_tables_structure(
+        self,
+        file_id: str,
+        notes: Dict[str, Any],
+        verbose: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Validate NOTE table completeness/structure against the PDF using a compact manifest
+        (to avoid context overflows). This does NOT validate every numeric cell.
+
+        Args:
+            file_id: OpenAI file ID of the source PDF
+            notes: Dict of note objects (ideally <= ~5 notes) keyed by note_<id>
+            verbose: Whether to print results
+        """
+        import json
+
+        def _safe_note_id(note_key: str, md: Dict[str, Any]) -> str:
+            nid = md.get("note_id") if isinstance(md, dict) else None
+            if isinstance(nid, str) and nid.strip():
+                return nid.strip()
+            if isinstance(note_key, str) and note_key.startswith("note_"):
+                return note_key.replace("note_", "").replace("_", ".")
+            return str(note_key)
+
+        # Build a compact manifest
+        summaries: List[str] = []
+        for note_key, note_data in notes.items():
+            if not isinstance(note_data, dict):
+                continue
+            md = note_data.get("metadata") if isinstance(note_data.get("metadata"), dict) else {}
+            note_id = _safe_note_id(str(note_key), md)
+            note_title = md.get("note_title") if isinstance(md.get("note_title"), str) else ""
+            tables = note_data.get("tables") if isinstance(note_data.get("tables"), list) else []
+            header = f"NOTE {note_id}: {note_title}".strip()
+            summaries.append(header)
+            for t in tables[:50]:
+                if not isinstance(t, dict):
+                    continue
+                table_id = t.get("table_id")
+                if not isinstance(table_id, str):
+                    table_id = ""
+                table_type = t.get("table_type") if isinstance(t.get("table_type"), str) else ""
+                tmd = t.get("metadata") if isinstance(t.get("metadata"), dict) else {}
+                periods = tmd.get("periods") if isinstance(tmd.get("periods"), list) else []
+                cols = tmd.get("columns") if isinstance(tmd.get("columns"), list) else []
+                period_labels = []
+                for p in periods:
+                    if isinstance(p, dict) and isinstance(p.get("label"), str):
+                        period_labels.append(p["label"])
+                    elif isinstance(p, str):
+                        period_labels.append(p)
+                col_labels = []
+                for c in cols:
+                    if isinstance(c, dict) and isinstance(c.get("label"), str):
+                        col_labels.append(c["label"])
+                    elif isinstance(c, dict) and isinstance(c.get("header"), str):
+                        col_labels.append(c["header"])
+                lines = t.get("lines")
+                if lines is None:
+                    lines = t.get("rows")
+                line_count = len(lines) if isinstance(lines, list) else 0
+                first_label = ""
+                last_label = ""
+                if isinstance(lines, list) and lines:
+                    first = lines[0] if isinstance(lines[0], dict) else {}
+                    last = lines[-1] if isinstance(lines[-1], dict) else {}
+                    first_label = first.get("label") if isinstance(first.get("label"), str) else ""
+                    last_label = last.get("label") if isinstance(last.get("label"), str) else ""
+
+                axis = "periods" if period_labels else ("columns" if col_labels else "unknown")
+                axis_labels = period_labels if period_labels else col_labels
+                summaries.append(f"- {table_id} ({table_type or axis}, {line_count} rows)")
+                if axis_labels:
+                    summaries.append(f"  columns: " + " | ".join(axis_labels[:24]))
+                if first_label or last_label:
+                    summaries.append(f"  first: {first_label}")
+                    summaries.append(f"  last: {last_label}")
+
+        manifest = "\n".join(summaries)
+
+        prompt = "You are validating extracted NOTE TABLE STRUCTURE against the source PDF.\n"
+        prompt += "You MUST return ONLY valid JSON.\n"
+        prompt += "Do NOT include markdown or commentary.\n\n"
+        prompt += "TASK:\n"
+        prompt += "- For each note and each table_id listed, verify the table exists in the PDF under that note.\n"
+        prompt += "- Verify table_id naming matches the PDF printed labels (e.g., 'Table 3.4.A').\n"
+        prompt += "- Verify the extracted column headers are complete (especially comparative date blocks like 31.12.2024 AND 31.12.2023).\n"
+        prompt += "- Verify the extracted rows are not overly summarized (should be line-by-line, not totals-only).\n\n"
+        prompt += "MANIFEST (extracted):\n"
+        prompt += manifest + "\n\n"
+        prompt += "RESPONSE JSON SCHEMA:\n"
+        prompt += "{\n"
+        prompt += '  "overall": "VALID" | "INVALID",\n'
+        prompt += '  "issues": [\n'
+        prompt += '    {\n'
+        prompt += '      "note_id": "7.1",\n'
+        prompt += '      "table_id": "Table 3.4.A",\n'
+        prompt += '      "issue_type": "missing_table|missing_columns|summarized_rows|wrong_table_id|other",\n'
+        prompt += '      "details": "short",\n'
+        prompt += '      "required_columns": ["optional list of missing column headers"]\n'
+        prompt += "    }\n"
+        prompt += "  ]\n"
+        prompt += "}\n"
+
+        try:
+            response = self.client.responses.create(
+                model=self.model,
+                input=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": file_id},
+                        {"type": "input_text", "text": prompt}
+                    ]
+                }]
+            )
+            out = response.output_text if hasattr(response, "output_text") else str(response)
+            parsed = json.loads(out)
+            overall = parsed.get("overall")
+            issues = parsed.get("issues") if isinstance(parsed.get("issues"), list) else []
+            is_valid = isinstance(overall, str) and overall.upper() == "VALID" and len(issues) == 0
+
+            if verbose:
+                if is_valid:
+                    console.print(f"[green]✓ Notes table structure validation passed[/green]")
+                else:
+                    console.print(f"[yellow]⚠ Notes table structure validation found issues ({len(issues)})[/yellow]")
+
+            return {
+                "is_valid": is_valid,
+                "confidence": 100 if is_valid else 50,
+                "issues": issues,
+                "validation_output": out,
+                "success": True,
+            }
+        except Exception as e:
+            if verbose:
+                console.print(f"[yellow]⚠ Notes table structure validation error: {e}[/yellow]")
+            return {
+                "is_valid": False,
+                "confidence": 0,
+                "issues": [{"issue_type": "validation_error", "details": str(e)}],
+                "validation_output": None,
+                "success": False,
+            }
+
     def _validate_single_statement_structure(
         self,
         file_id: str,
@@ -1065,7 +1701,7 @@ If INVALID, list specific corrections needed.
         # Get all dynamic sections from the extracted data
         extracted_sections = [
             k for k in data.keys()
-            if k not in ["metadata", "extraction_notes"] and isinstance(data[k], list)
+            if k not in ["metadata", "extraction_notes", "explanatory_text"] and isinstance(data[k], list)
         ]
 
         if not extracted_sections:
@@ -1350,7 +1986,7 @@ If INVALID, list specific corrections needed.
 
         # Search through all sections for the line item with matching label
         for section_name, section_data in statement_data.items():
-            if section_name in ['metadata', 'extraction_notes']:
+            if section_name in ['metadata', 'extraction_notes', 'explanatory_text']:
                 continue
 
             if not isinstance(section_data, list):
